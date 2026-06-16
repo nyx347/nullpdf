@@ -1,0 +1,19 @@
+[package]
+name = "nullpdf"
+version = "0.2.0"
+edition = "2021"
+description = "Minimal PDF reader focused on freehand drawing/annotation"
+
+[dependencies]
+eframe = { version = "0.34", default-features = true }
+egui = "0.34"
+pdfium-render = "0.8.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.15"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
