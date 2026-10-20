@@ -5,12 +5,14 @@
 //! resolution, and lets an externally-edited base PDF reload with annotations still
 //! aligned, as long as page order/count is unchanged.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// A single freehand mark. `Freehand` keeps every sampled point; `Line` keeps exactly
-/// two points (press + release) and is drawn as a straight segment at any angle.
+/// A single freehand mark. `Freehand` keeps the (smoothed) sampled points — a single point
+/// is a dot; `Line` keeps exactly two points (press + release) and is drawn as a straight
+/// segment at any angle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stroke {
     /// Page index this stroke belongs to.
@@ -35,7 +37,8 @@ pub enum StrokeKind {
 
 /// A piece of text pinned to a page. Like strokes, the anchor is stored in normalised
 /// page space (top-left origin) so it survives zoom/rotation and an external reload.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// `text` may contain `\n` line breaks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextAnnotation {
     /// Page index this text belongs to.
     pub page: usize,
@@ -66,6 +69,23 @@ impl Annotation {
             Annotation::Text(t) => t.id,
         }
     }
+
+    pub fn page(&self) -> usize {
+        match self {
+            Annotation::Stroke(s) => s.page,
+            Annotation::Text(t) => t.page,
+        }
+    }
+}
+
+/// Result of looking for a sidecar beside a PDF.
+pub enum SidecarLoad {
+    /// No sidecar exists yet.
+    Missing,
+    Loaded(AnnotationSet),
+    /// A sidecar exists but couldn't be read or parsed (message says why). It must not be
+    /// silently overwritten.
+    Unreadable(String),
 }
 
 /// All annotations for one document, plus enough metadata to sanity-check a reload.
@@ -92,6 +112,10 @@ impl AnnotationSet {
             texts: Vec::new(),
             next_id: 1,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.strokes.is_empty() && self.texts.is_empty()
     }
 
     /// Assign a fresh runtime id (used after load and when creating strokes).
@@ -136,21 +160,23 @@ impl AnnotationSet {
         }
     }
 
-    /// Re-insert a previously-removed annotation (keeps its existing id). Used by undo/redo.
-    pub fn reinsert(&mut self, ann: Annotation) {
+    /// Re-insert a previously-removed annotation at its old index within its own list
+    /// (keeps its id and its stacking order). Used by undo/redo.
+    pub fn insert_at(&mut self, index: usize, ann: Annotation) {
         match ann {
-            Annotation::Stroke(s) => self.strokes.push(s),
-            Annotation::Text(t) => self.texts.push(t),
+            Annotation::Stroke(s) => self.strokes.insert(index.min(self.strokes.len()), s),
+            Annotation::Text(t) => self.texts.insert(index.min(self.texts.len()), t),
         }
     }
 
-    /// Remove the annotation (stroke or text) with the given id, returning it if present.
-    pub fn remove(&mut self, id: u64) -> Option<Annotation> {
-        if let Some(pos) = self.strokes.iter().position(|s| s.id == id) {
-            return Some(Annotation::Stroke(self.strokes.remove(pos)));
+    /// Remove the annotation (stroke or text) with the given id, returning its index within
+    /// its own list and the annotation itself.
+    pub fn remove(&mut self, id: u64) -> Option<(usize, Annotation)> {
+        if let Some(i) = self.strokes.iter().position(|s| s.id == id) {
+            return Some((i, Annotation::Stroke(self.strokes.remove(i))));
         }
-        if let Some(pos) = self.texts.iter().position(|t| t.id == id) {
-            return Some(Annotation::Text(self.texts.remove(pos)));
+        if let Some(i) = self.texts.iter().position(|t| t.id == id) {
+            return Some((i, Annotation::Text(self.texts.remove(i))));
         }
         None
     }
@@ -162,11 +188,18 @@ impl AnnotationSet {
         PathBuf::from(p)
     }
 
-    /// Load annotations from the sidecar beside `pdf_path`, if it exists and parses.
-    pub fn load_for(pdf_path: &Path) -> Option<Self> {
+    /// Load annotations from the sidecar beside `pdf_path`.
+    pub fn load_for(pdf_path: &Path) -> SidecarLoad {
         let path = Self::sidecar_path(pdf_path);
-        let data = std::fs::read_to_string(&path).ok()?;
-        let mut set: AnnotationSet = serde_json::from_str(&data).ok()?;
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SidecarLoad::Missing,
+            Err(e) => return SidecarLoad::Unreadable(e.to_string()),
+        };
+        let mut set: AnnotationSet = match serde_json::from_str(&data) {
+            Ok(s) => s,
+            Err(e) => return SidecarLoad::Unreadable(e.to_string()),
+        };
         // Re-establish runtime ids deterministically after deserialization.
         set.next_id = 1;
         for i in 0..set.strokes.len() {
@@ -177,15 +210,23 @@ impl AnnotationSet {
             let id = set.assign_id();
             set.texts[i].id = id;
         }
-        Some(set)
+        SidecarLoad::Loaded(set)
     }
 
-    /// Write annotations to the sidecar beside `pdf_path`.
+    /// Write annotations to the sidecar beside `pdf_path`. The file is written to a
+    /// temporary sibling first and renamed into place, so a crash or full disk mid-write
+    /// can never leave a truncated sidecar behind.
     pub fn save_for(&self, pdf_path: &Path) -> std::io::Result<()> {
         let path = Self::sidecar_path(pdf_path);
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, data)
+        let mut tmp: OsString = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, data)?;
+        std::fs::rename(&tmp, &path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
     }
 }
 
@@ -214,11 +255,61 @@ pub fn chaikin(points: &[[f32; 2]], iterations: usize) -> Vec<[f32; 2]> {
     pts
 }
 
+/// Ramer–Douglas–Peucker simplification of a normalised-coordinate polyline.
+///
+/// `scale` converts normalised units into a common metric (page points per axis, since
+/// pages are rarely square) and `tolerance` is the maximum deviation allowed in that metric.
+/// With a sub-pixel tolerance this is visually lossless; it just drops the redundant points
+/// that full-rate sampling + Chaikin produce on gentle curves. Endpoints are always kept.
+pub fn simplify(points: &[[f32; 2]], scale: [f32; 2], tolerance: f32) -> Vec<[f32; 2]> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+    let p = |i: usize| [points[i][0] * scale[0], points[i][1] * scale[1]];
+    let mut keep = vec![false; points.len()];
+    keep[0] = true;
+    keep[points.len() - 1] = true;
+    let mut stack = vec![(0usize, points.len() - 1)];
+    while let Some((a, b)) = stack.pop() {
+        if b <= a + 1 {
+            continue;
+        }
+        let (pa, pb) = (p(a), p(b));
+        let (dx, dy) = (pb[0] - pa[0], pb[1] - pa[1]);
+        let len = dx.hypot(dy);
+        let mut worst = (0.0f32, a);
+        for i in a + 1..b {
+            let pi = p(i);
+            let d = if len <= f32::EPSILON {
+                (pi[0] - pa[0]).hypot(pi[1] - pa[1])
+            } else {
+                ((pi[0] - pa[0]) * dy - (pi[1] - pa[1]) * dx).abs() / len
+            };
+            if d > worst.0 {
+                worst = (d, i);
+            }
+        }
+        if worst.0 > tolerance {
+            keep[worst.1] = true;
+            stack.push((a, worst.1));
+            stack.push((worst.1, b));
+        }
+    }
+    points
+        .iter()
+        .zip(keep)
+        .filter_map(|(pt, k)| k.then_some(*pt))
+        .collect()
+}
+
 /// One reversible edit. The variant describes what *was done* to the document.
 #[derive(Clone, Debug)]
 pub enum Edit {
     Added(Annotation),
-    Erased(Annotation),
+    /// One erase gesture (which may sweep over several annotations), in removal order. Each
+    /// entry keeps the index the annotation had in its list when it was removed, so undo
+    /// restores the exact stacking order.
+    Erased(Vec<(usize, Annotation)>),
     /// A text annotation changed in place (content, style, or position). Stored as the
     /// full before/after so undo/redo just restores one or the other by id.
     EditedText {
@@ -241,9 +332,12 @@ impl History {
         self.redo.clear();
     }
 
-    /// Record that `ann` was just erased. Clears the redo stack.
-    pub fn record_erase(&mut self, ann: Annotation) {
-        self.undo.push(Edit::Erased(ann));
+    /// Record one erase gesture. Clears the redo stack; an empty gesture records nothing.
+    pub fn record_erase(&mut self, erased: Vec<(usize, Annotation)>) {
+        if erased.is_empty() {
+            return;
+        }
+        self.undo.push(Edit::Erased(erased));
         self.redo.clear();
     }
 
@@ -261,37 +355,53 @@ impl History {
         !self.redo.is_empty()
     }
 
-    /// Reverse the most recent edit against `set`.
-    pub fn undo(&mut self, set: &mut AnnotationSet) {
-        let Some(edit) = self.undo.pop() else { return };
-        match &edit {
+    /// Reverse the most recent edit against `set`, returning the annotations it touched
+    /// (so the caller can bring them into view), or `None` if there was nothing to undo.
+    pub fn undo(&mut self, set: &mut AnnotationSet) -> Option<Vec<Annotation>> {
+        let edit = self.undo.pop()?;
+        let touched = match &edit {
             Edit::Added(a) => {
                 set.remove(a.id());
+                vec![a.clone()]
             }
-            Edit::Erased(a) => {
-                set.reinsert(a.clone());
+            Edit::Erased(items) => {
+                // Each index was recorded after the earlier removals of the same sweep, so
+                // replaying the removals backwards rebuilds each list exactly as it was.
+                for (i, a) in items.iter().rev() {
+                    set.insert_at(*i, a.clone());
+                }
+                items.iter().map(|(_, a)| a.clone()).collect()
             }
             Edit::EditedText { before, .. } => {
                 set.replace_text(before.clone());
+                vec![Annotation::Text(before.clone())]
             }
-        }
+        };
         self.redo.push(edit);
+        Some(touched)
     }
 
-    /// Re-apply the most recently undone edit against `set`.
-    pub fn redo(&mut self, set: &mut AnnotationSet) {
-        let Some(edit) = self.redo.pop() else { return };
-        match &edit {
+    /// Re-apply the most recently undone edit against `set`, returning the annotations it
+    /// touched, or `None` if there was nothing to redo.
+    pub fn redo(&mut self, set: &mut AnnotationSet) -> Option<Vec<Annotation>> {
+        let edit = self.redo.pop()?;
+        let touched = match &edit {
             Edit::Added(a) => {
-                set.reinsert(a.clone());
+                set.insert_at(usize::MAX, a.clone());
+                vec![a.clone()]
             }
-            Edit::Erased(a) => {
-                set.remove(a.id());
+            Edit::Erased(items) => {
+                for (_, a) in items {
+                    set.remove(a.id());
+                }
+                items.iter().map(|(_, a)| a.clone()).collect()
             }
             Edit::EditedText { after, .. } => {
                 set.replace_text(after.clone());
+                vec![Annotation::Text(after.clone())]
             }
-        }
+        };
         self.undo.push(edit);
+        Some(touched)
     }
 }
