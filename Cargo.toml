@@ -13,6 +13,8 @@ serde_json = "1"
 rfd = "0.15"
 # Charmap lookups for export font fallback; already part of egui's font stack.
 skrifa = "0.40"
+# Accent-insensitive bookmark search; already built for egui-winit's link handling (url/idna).
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 
 [profile.dev]
 opt-level = 1

@@ -2,13 +2,16 @@
 //! action the keymap and toolbar can trigger.
 //!
 //! Frame order: poll for reload → drops/close → keyboard → canvas (pointer gestures →
-//! camera glide + clamp → page textures → paint) → text editor overlay → chrome → autosave.
-//! Submodules split the work: `input` (keyboard + pointer gestures), `canvas` (painting the
-//! document), `text` (text annotations: layout, editing, export runs) and `chrome` (the
-//! floating toolbar, status line, toasts, cheat sheet and welcome screen).
+//! camera glide + clamp → page textures → paint) → text editor overlay → chrome → search →
+//! autosave. Submodules split the work: `input` (keyboard + pointer gestures), `canvas`
+//! (painting the document), `text` (text annotations: layout, editing, export runs),
+//! `chrome` (the floating toolbar, status line, toasts, cheat sheet and welcome screen),
+//! `find` (the find bar and text search) and `bookmarks` (the bookmark palette).
 
+mod bookmarks;
 mod canvas;
 mod chrome;
+mod find;
 mod input;
 mod text;
 
@@ -22,6 +25,7 @@ use pdfium_render::prelude::Pdfium;
 use crate::annotation::{Annotation, AnnotationSet, History, SidecarLoad};
 use crate::keymap::Action;
 use crate::pdf::{PageNeed, PdfDoc};
+use crate::search::TextSearch;
 use crate::theme;
 use crate::tools::{
     step_size, Brush, Gesture, StyleTarget, TextEditing, Tool, ERASER_SIZES, FONT_SIZES,
@@ -203,6 +207,17 @@ pub struct App {
 
     chrome_visible: bool,
     help_open: bool,
+    /// The find bar is open (`/`).
+    find_open: bool,
+    /// The find query, kept when the bar closes so it can be reopened or repeated (`N`).
+    find_query: String,
+    find_case: bool,
+    /// The search for `find_query` while the bar is open (`None` while the query is empty).
+    search: Option<TextSearch>,
+    /// The find field should take keyboard focus, its text selected, this frame.
+    find_focus: bool,
+    /// The bookmark palette (`B`), while open.
+    bookmarks: Option<bookmarks::Palette>,
     toast: Option<Toast>,
     /// Window title last sent, to avoid resending every frame.
     title: String,
@@ -271,6 +286,12 @@ impl App {
             close_armed: false,
             chrome_visible: true,
             help_open: false,
+            find_open: false,
+            find_query: String::new(),
+            find_case: false,
+            search: None,
+            find_focus: false,
+            bookmarks: None,
             toast: None,
             title: String::new(),
             now: 0.0,
@@ -409,6 +430,8 @@ impl App {
         self.glide = None;
         self.gesture = Gesture::None;
         self.text_edit = None;
+        self.close_find();
+        self.bookmarks = None;
     }
 
     /// Re-open the PDF (pages only) when the file changes on disk, preserving the
@@ -444,6 +467,11 @@ impl App {
         self.layout = Layout::new(doc.sizes.clone());
         self.pdf = Some(doc);
         self.pdf_mtime = Some(new_mtime);
+        // The text and outline may have changed too.
+        if self.search.is_some() {
+            self.restart_search(false);
+        }
+        self.refilter_bookmarks();
         if page_count != self.set.page_count {
             self.error(format!(
                 "Reloaded — now {page_count} pages (was {}); annotations may be misplaced",
@@ -764,12 +792,17 @@ impl App {
 
     // --- camera ----------------------------------------------------------------------
 
-    /// The part of the viewport not covered by floating chrome.
+    /// The part of the viewport not covered by floating chrome. The find bar shares the
+    /// status line's strip, and keeps it clear even with the toolbar hidden.
     fn safe_rect(&self) -> Rect {
         let mut r = self.viewport;
-        if self.chrome_visible && self.pdf.is_some() {
-            r.min.y += TOOLBAR_SPACE;
-            r.max.y -= STATUS_SPACE;
+        if self.pdf.is_some() {
+            if self.chrome_visible {
+                r.min.y += TOOLBAR_SPACE;
+            }
+            if self.chrome_visible || self.find_open {
+                r.max.y -= STATUS_SPACE;
+            }
         }
         if r.height() < 40.0 {
             return self.viewport;
@@ -789,6 +822,16 @@ impl App {
     /// The page under the centre of the visible area (what the status line calls "current").
     fn current_page(&self) -> usize {
         self.page_under(&self.cam)
+    }
+
+    /// Where reading is, `down` (0..1) of the way down the visible area: the page there,
+    /// and how far down it (points; negative above its top edge).
+    fn reading_position(&self, down: f32) -> (usize, f32) {
+        let safe = self.safe_rect();
+        let at = Pos2::new(safe.center().x, safe.top() + safe.height() * down);
+        let doc = self.glide_target().screen_to_doc(at, self.viewport);
+        let page = self.layout.page_near_y(doc.y).unwrap_or(0);
+        (page, doc.y - self.layout.page_rect(page).top())
     }
 
     /// The page under the centre of the visible area as seen by `cam`.
@@ -844,6 +887,25 @@ impl App {
         cam.center = cam.center_for(r.center(), Pos2::new(x, y), self.viewport);
         cam.clamp_to(&self.layout, self.viewport, safe);
         cam
+    }
+
+    /// Glide to a link target: page `i`, with the point `offset` points down it at the top
+    /// of the view (or, rotated, in its centre) when the page doesn't fit whole.
+    fn show_destination(&mut self, i: usize, offset: Option<f32>) {
+        let mut cam = self.page_camera(self.glide_target(), i);
+        let r = self.layout.page_rect(i);
+        let safe = self.safe_rect();
+        if let Some(y) = offset.filter(|_| cam.screen_extent(r.size()).y > safe.height()) {
+            let target = Pos2::new(r.center().x, r.top() + y);
+            let goal = if cam.is_upright() {
+                let x = cam.doc_to_screen(target, self.viewport).x;
+                Pos2::new(x, safe.top() + FIT_MARGIN)
+            } else {
+                safe.center()
+            };
+            cam.center = cam.center_for(target, goal, self.viewport);
+        }
+        self.glide_to(cam);
     }
 
     /// `base` re-fitted to its current page: the whole page for [`Fit::Page`]; for
@@ -1065,6 +1127,10 @@ impl App {
             Action::LastPage => self.goto_page(i32::MAX),
             Action::ScreenUp => self.scroll_screen(-1.0),
             Action::ScreenDown => self.scroll_screen(1.0),
+            Action::Find => self.open_find(),
+            Action::FindNext => self.find_step(1),
+            Action::FindPrev => self.find_step(-1),
+            Action::Bookmarks => self.toggle_bookmarks(),
             Action::Open => self.open_dialog(),
             Action::Save => self.save(),
             Action::Export => self.export_dialog(),
@@ -1082,6 +1148,10 @@ impl App {
                     self.cancel_gesture();
                 } else if self.text_edit.is_some() {
                     self.cancel_text();
+                } else if self.bookmarks.is_some() {
+                    self.bookmarks = None;
+                } else if self.find_open {
+                    self.close_find();
                 } else if self.tool != Tool::Nav {
                     self.set_tool(Tool::Nav);
                 }
@@ -1195,13 +1265,14 @@ impl eframe::App for App {
             self.dispatch(a);
         }
 
+        let searching = self.search_tick();
         self.autosave_tick();
         self.update_title(&ctx);
 
-        // Repaint scheduling: animations and pending renders now; settling, autosave and a
-        // failed reload a little later. Otherwise the app sleeps until input (or the file
-        // watcher) wakes it.
-        if pending_render || self.glide.is_some() {
+        // Repaint scheduling: animations, pending renders and searches now; settling,
+        // autosave and a failed reload a little later. Otherwise the app sleeps until input
+        // (or the file watcher) wakes it.
+        if pending_render || searching || self.glide.is_some() {
             ctx.request_repaint();
         }
         if let Some(t) = &self.toast {

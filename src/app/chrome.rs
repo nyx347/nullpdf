@@ -1,5 +1,6 @@
 //! Floating chrome: the toolbar pill, status line, toasts, the `?` cheat sheet, the welcome
-//! screen and the drop overlay.
+//! screen and the drop overlay. (The find bar and the bookmark palette live in `find` and
+//! `bookmarks`, built from the same widgets.)
 //!
 //! Every control is a custom-painted, *non-focusable* widget (`Sense::CLICK`), so clicking
 //! the chrome can never leave a widget holding keyboard focus — which would otherwise make
@@ -24,14 +25,14 @@ const TOOLS: [(Tool, Icon); 5] = [
     (Tool::Text, Icon::Text),
 ];
 
-/// Below this window width the toolbar drops its swatches and file buttons (the custom
+/// Below this window width the toolbar drops its swatches, find and file buttons (the custom
 /// colour button and the keys still reach everything).
-const COMPACT_WIDTH: f32 = 800.0;
+const COMPACT_WIDTH: f32 = 840.0;
 
 /// Wheel distance (px) that steps the size control by one rung.
 const SIZE_WHEEL_STEP: f32 = 40.0;
 
-fn pill() -> Frame {
+pub(super) fn pill() -> Frame {
     Frame::new()
         .fill(theme::SURFACE)
         .stroke(theme::line(1.0, theme::BORDER))
@@ -52,12 +53,23 @@ fn opaque(c: Color32) -> Color32 {
 
 /// Square icon button; `active` marks the selected tool.
 fn icon_button(ui: &mut Ui, icon: Icon, active: bool, enabled: bool) -> Response {
+    icon_button_sized(ui, icon, theme::BUTTON, active, enabled)
+}
+
+/// [`icon_button`] of any size.
+pub(super) fn icon_button_sized(
+    ui: &mut Ui,
+    icon: Icon,
+    side: f32,
+    active: bool,
+    enabled: bool,
+) -> Response {
     let sense = if enabled {
         Sense::CLICK
     } else {
         Sense::hover()
     };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(theme::BUTTON), sense);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(side), sense);
     let painter = ui.painter();
     let bg = if active || (enabled && resp.is_pointer_button_down_on()) {
         theme::SURFACE_ACTIVE
@@ -66,13 +78,13 @@ fn icon_button(ui: &mut Ui, icon: Icon, active: bool, enabled: bool) -> Response
     } else {
         Color32::TRANSPARENT
     };
-    painter.rect_filled(rect, 8.0, bg);
+    painter.rect_filled(rect, side * 0.25, bg);
     let fg = match (enabled, active) {
         (false, _) => theme::TEXT_FAINT,
         (true, true) => Color32::WHITE,
         (true, false) => theme::TEXT,
     };
-    icons::paint(painter, rect.shrink(6.0), icon, fg);
+    icons::paint(painter, rect.shrink(side * 0.1875), icon, fg);
     if enabled {
         resp.on_hover_cursor(CursorIcon::PointingHand)
     } else {
@@ -91,7 +103,7 @@ fn divider(ui: &mut Ui) {
 
 /// A keyboard key, drawn as a small cap. Arrow keys get painted arrows (the UI font has
 /// no arrow glyphs).
-fn keycap(ui: &mut Ui, label: &str) {
+pub(super) fn keycap(ui: &mut Ui, label: &str) {
     let font = FontId::proportional(12.0);
     let arrow = match label {
         "↑" => Some(-Vec2::Y),
@@ -150,7 +162,7 @@ fn action_caps(ui: &mut Ui, action: Action) {
 }
 
 /// Hover tooltip: what the control does and its keys.
-fn tooltip(resp: &Response, label: &str, actions: &[Action]) {
+pub(super) fn tooltip(resp: &Response, label: &str, actions: &[Action]) {
     resp.clone().on_hover_ui(|ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(label).color(theme::TEXT));
@@ -172,6 +184,8 @@ impl App {
             self.toolbar(&ctx, actions);
             self.status_line(&ctx);
         }
+        self.find_bar(&ctx);
+        self.bookmarks_palette(&ctx);
         self.toast_ui(&ctx);
         if self.help_open {
             self.help_sheet(&ctx, actions);
@@ -228,16 +242,31 @@ impl App {
                         divider(ui);
                         let mut file = vec![(Icon::Help, "Shortcuts", Action::Help)];
                         if !compact {
-                            file.insert(0, (Icon::Open, "Open", Action::Open));
-                            file.insert(1, (Icon::Export, "Export flattened copy", Action::Export));
-                        }
-                        for (icon, label, action) in file {
-                            let r = icon_button(
-                                ui,
-                                icon,
-                                action == Action::Help && self.help_open,
-                                true,
+                            file.splice(
+                                0..0,
+                                [
+                                    (Icon::Search, "Find in document", Action::Find),
+                                    (Icon::Bookmark, "Search bookmarks", Action::Bookmarks),
+                                    (Icon::Open, "Open", Action::Open),
+                                    (Icon::Export, "Export flattened copy", Action::Export),
+                                ],
                             );
+                        }
+                        let has_outline = self.pdf.as_ref().is_some_and(|p| !p.outline.is_empty());
+                        for (icon, label, action) in file {
+                            let active = match action {
+                                Action::Help => self.help_open,
+                                Action::Find => self.find_open,
+                                Action::Bookmarks => self.bookmarks.is_some(),
+                                _ => false,
+                            };
+                            let enabled = action != Action::Bookmarks || has_outline;
+                            let r = icon_button(ui, icon, active, enabled);
+                            let label = if enabled {
+                                label
+                            } else {
+                                "No bookmarks in this PDF"
+                            };
                             tooltip(&r, label, &[action]);
                             if r.clicked() {
                                 actions.push(action);
@@ -377,13 +406,23 @@ impl App {
         tooltip(&resp, "Size", &[Action::SizeDown, Action::SizeUp]);
     }
 
-    /// File · page · zoom (· rotation) in a quiet pill at the bottom left.
+    /// File · page · zoom (· rotation) in a quiet pill at the bottom left. The find bar
+    /// shares the row, so while it's open the file name shortens or goes (and on a very
+    /// narrow window the whole line does).
     fn status_line(&mut self, ctx: &egui::Context) {
+        let width = self.viewport.width();
+        let name_chars = match (self.find_open, width) {
+            (false, _) => 42,
+            (true, w) if w >= 1040.0 => 30,
+            (true, w) if w >= 860.0 => 14,
+            (true, w) if w >= 620.0 => 0,
+            (true, _) => return,
+        };
         let page = self.current_page() + 1;
         let pages = self.layout.len();
         let zoom = self.cam.zoom / ACTUAL_SIZE_ZOOM * 100.0;
         let rotation = crate::view::wrap_angle(self.cam.rotation).to_degrees();
-        let name = elide(&self.file_name(), 42);
+        let name = elide(&self.file_name(), name_chars);
         let mut upright = false;
         egui::Area::new(Id::new("status"))
             .order(Order::Foreground)
@@ -404,8 +443,10 @@ impl App {
                             let dot = |ui: &mut Ui| {
                                 ui.label(text("  ·  ".into(), theme::TEXT_FAINT));
                             };
-                            ui.label(text(name, theme::TEXT_DIM));
-                            dot(ui);
+                            if !name.is_empty() {
+                                ui.label(text(name, theme::TEXT_DIM));
+                                dot(ui);
+                            }
                             ui.label(text(format!("{page} / {pages}"), theme::TEXT));
                             dot(ui);
                             ui.label(text(format!("{zoom:.0}%"), theme::TEXT_DIM));
@@ -460,7 +501,7 @@ impl App {
         }
         let alpha =
             ((age / TOAST_FADE_IN).min(1.0) * ((ttl - age) / TOAST_FADE_OUT).min(1.0)) as f32;
-        let lift = if self.chrome_visible && self.pdf.is_some() {
+        let lift = if (self.chrome_visible || self.find_open) && self.pdf.is_some() {
             theme::MARGIN + 40.0
         } else {
             theme::MARGIN
@@ -528,7 +569,7 @@ impl App {
                             );
                         });
                         ui.add_space(14.0);
-                        let columns: [&[usize]; 3] = [&[0, 1, 2], &[3, 4], &[5, 6]];
+                        let columns: [&[usize]; 3] = [&[0, 1, 2], &[3, 4], &[5, 6, 7]];
                         let ncols = if width < 560.0 { 1 } else { 3 };
                         if ncols == 1 {
                             for i in 0..HELP.len() {
@@ -727,11 +768,14 @@ fn open_button(ui: &mut Ui) -> Response {
 }
 
 /// Middle-elide `s` to at most `max` characters, keeping the end (the extension and the
-/// distinctive tail of most file names).
+/// distinctive tail of most file names). `max == 0` leaves nothing.
 fn elide(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
         return s.to_owned();
+    }
+    if max == 0 {
+        return String::new();
     }
     let tail = max * 2 / 3;
     let head = max - tail - 1;

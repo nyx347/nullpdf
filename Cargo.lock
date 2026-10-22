@@ -2001,6 +2001,7 @@ version = "0.2.0"
 dependencies = [
  "eframe",
  "egui",
+ "icu_normalizer",
  "pdfium-render",
  "rfd",
  "serde",

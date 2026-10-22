@@ -146,6 +146,8 @@ impl App {
     }
 
     fn begin_gesture(&mut self, button: PointerButton, pos: Pos2) {
+        // A press on the document leaves the find field.
+        self.blur_find();
         // A press outside an open text editor commits it; a left press does nothing else.
         if self.text_edit.is_some() {
             self.commit_text();

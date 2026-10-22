@@ -6,16 +6,20 @@
 //! "detail tile" covering just the visible part of the page is rendered at full resolution
 //! on top. All rendering is time-budgeted per frame, nearest pages first, and far-away
 //! textures are evicted to bound memory.
+//!
+//! Text search and the outline (bookmarks) are read here too, converted from PDF user space
+//! into page-local points (top-left origin, as displayed) with pdfium's own page transform.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
-use egui::{Context, Rect, TextureHandle, TextureId, TextureOptions};
+use egui::{Context, Pos2, Rect, TextureHandle, TextureId, TextureOptions, Vec2};
 use pdfium_render::prelude::*;
 
 use crate::annotation::Stroke;
+use crate::search::PageHits;
 use crate::view::PageSize;
 
 /// Longest side (px) of a whole-page texture; beyond this a detail tile takes over.
@@ -29,6 +33,13 @@ const EXACT_TOLERANCE: f32 = 0.015;
 /// Extra area rendered around the visible part of a page for a detail tile, so small pans
 /// stay sharp.
 const TILE_MARGIN: f32 = 0.35;
+/// Pdfium maps page points to whole device pixels, so the page transform is sampled at
+/// this many pixels per point, over this span (points), to get it to well under 0.1 pt.
+const XFORM_SCALE: f32 = 64.0;
+const XFORM_SPAN: f32 = 1024.0;
+/// Guards against pathological (or cyclic) outlines.
+const MAX_OUTLINE_ITEMS: usize = 20_000;
+const MAX_OUTLINE_DEPTH: usize = 64;
 
 struct PageTex {
     handle: TextureHandle,
@@ -71,10 +82,71 @@ pub struct PageImage {
 pub struct PdfDoc {
     doc: PdfDocument<'static>,
     pub sizes: Vec<PageSize>,
+    /// The document's bookmarks, depth-first (empty if it has none).
+    pub outline: Vec<OutlineItem>,
     /// Interactive forms only render without a transform, so they get no detail tiles.
     has_form: bool,
     pages: HashMap<usize, PageTex>,
     tiles: HashMap<usize, Tile>,
+}
+
+/// One bookmark of the document outline.
+pub struct OutlineItem {
+    /// Title, with line breaks and other control characters flattened to spaces.
+    pub title: String,
+    /// Nesting depth (0 = top level).
+    pub depth: usize,
+    /// Index of the enclosing bookmark in the outline.
+    pub parent: Option<usize>,
+    /// Where it points, if into this document (not a web link or another file).
+    pub dest: Option<Dest>,
+}
+
+/// A bookmark's target: a page and, if the destination gives one, a point on it in PDF user
+/// space (resolved to page-local points by [`PdfDoc::dest_offset`] when it's followed).
+#[derive(Clone, Copy, Debug)]
+pub struct Dest {
+    pub page: usize,
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+}
+
+/// Affine map from a page's PDF user space (y-up, offset by its boxes) to page-local points
+/// (top-left origin, `/Rotate` applied — the page as rendered), taken from pdfium's own
+/// page-to-device transform so it agrees exactly with what is drawn.
+struct UserToPage {
+    origin: Pos2,
+    ex: Vec2,
+    ey: Vec2,
+}
+
+impl UserToPage {
+    fn of(page: &PdfPage) -> Option<Self> {
+        let config = PdfRenderConfig::new().scale_page_by_factor(XFORM_SCALE);
+        let at = |x: f32, y: f32| {
+            let (px, py) = page
+                .points_to_pixels(PdfPoints::new(x), PdfPoints::new(y), &config)
+                .ok()?;
+            Some(Vec2::new(px as f32, py as f32) / XFORM_SCALE)
+        };
+        let origin = at(0.0, 0.0)?;
+        Some(Self {
+            origin: origin.to_pos2(),
+            ex: (at(XFORM_SPAN, 0.0)? - origin) / XFORM_SPAN,
+            ey: (at(0.0, XFORM_SPAN)? - origin) / XFORM_SPAN,
+        })
+    }
+
+    fn point(&self, x: f32, y: f32) -> Pos2 {
+        self.origin + self.ex * x + self.ey * y
+    }
+
+    fn rect(&self, r: &PdfRect) -> Rect {
+        Rect::from_two_pos(
+            self.point(r.left().value, r.top().value),
+            self.point(r.right().value, r.bottom().value),
+        )
+    }
 }
 
 /// Text placed by the exporter: a run of characters in the embedded text font, with its
@@ -128,13 +200,51 @@ impl PdfDoc {
             }
         }
         let has_form = doc.form().is_some();
+        let outline = read_outline(&doc);
         Ok(Self {
             doc,
             sizes,
+            outline,
             has_form,
             pages: HashMap::new(),
             tiles: HashMap::new(),
         })
+    }
+
+    /// Every occurrence of `query` on page `idx`, in the page's text order, with the
+    /// rectangles (one per line) each one covers.
+    pub fn find_text(&self, idx: usize, query: &str, match_case: bool) -> PageHits {
+        let mut found = PageHits::default();
+        let Ok(page) = self.doc.pages().get(idx as u16) else {
+            return found;
+        };
+        let (Ok(text), Some(xf)) = (page.text(), UserToPage::of(&page)) else {
+            return found;
+        };
+        let options = PdfSearchOptions::new().match_case(match_case);
+        let Ok(search) = text.search(query, &options) else {
+            return found;
+        };
+        while let Some(segments) = search.find_next() {
+            let start = found.rects.len();
+            found
+                .rects
+                .extend(segments.iter().map(|s| xf.rect(&s.bounds())));
+            if found.rects.len() > start {
+                found.hits.push(start..found.rects.len());
+            }
+        }
+        found
+    }
+
+    /// How far down page `dest.page` (page-local points) a bookmark's target lies, if its
+    /// destination names a point.
+    pub fn dest_offset(&self, dest: Dest) -> Option<f32> {
+        let y = dest.y?;
+        let page = self.doc.pages().get(dest.page as u16).ok()?;
+        let p = UserToPage::of(&page)?.point(dest.x.unwrap_or(0.0), y);
+        let h = self.sizes.get(dest.page)?.h;
+        Some(p.y.clamp(0.0, h))
     }
 
     /// Take over `old`'s page textures (marked stale) so a reloaded document keeps showing
@@ -502,4 +612,60 @@ impl PdfDoc {
 
         doc.save_to_file(out)
     }
+}
+
+/// The document's bookmarks, depth-first (each before its children). Bookmarks pointing
+/// outside the document are kept, without a destination, so the tree stays intact.
+fn read_outline(doc: &PdfDocument) -> Vec<OutlineItem> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    // Siblings are pushed before children, so each subtree comes out whole and in order.
+    let mut stack: Vec<(PdfBookmark, usize, Option<usize>)> = Vec::new();
+    stack.extend(doc.bookmarks().root().map(|b| (b, 0, None)));
+    while let Some((b, depth, parent)) = stack.pop() {
+        if items.len() >= MAX_OUTLINE_ITEMS || !seen.insert(b.clone()) {
+            continue;
+        }
+        let title: String = b
+            .title()
+            .unwrap_or_default()
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let dest = match b.destination() {
+            Some(d) => dest_of(&d),
+            None => b.action().and_then(|a| {
+                let d = a.as_local_destination_action()?.destination().ok()?;
+                dest_of(&d)
+            }),
+        };
+        let index = items.len();
+        items.push(OutlineItem {
+            title: title.trim().to_owned(),
+            depth,
+            parent,
+            dest,
+        });
+        stack.extend(b.next_sibling().map(|s| (s, depth, parent)));
+        if depth < MAX_OUTLINE_DEPTH {
+            stack.extend(b.first_child().map(|c| (c, depth + 1, Some(index))));
+        }
+    }
+    items
+}
+
+fn dest_of(d: &PdfDestination) -> Option<Dest> {
+    use PdfDestinationViewSettings as V;
+    let page = d.page_index().ok()? as usize;
+    let (x, y) = match d.view_settings() {
+        Ok(V::SpecificCoordinatesAndZoom(x, y, _)) => (x, y),
+        Ok(V::FitPageHorizontallyToWindow(y) | V::FitBoundsHorizontallyToWindow(y)) => (None, y),
+        Ok(V::FitPageToRectangle(r)) => (Some(r.left()), Some(r.top())),
+        _ => (None, None),
+    };
+    Some(Dest {
+        page,
+        x: x.map(|v| v.value),
+        y: y.map(|v| v.value),
+    })
 }

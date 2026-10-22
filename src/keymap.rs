@@ -34,6 +34,12 @@ pub enum Action {
     LastPage,
     ScreenUp,
     ScreenDown,
+    /// Open the find bar (or return to it).
+    Find,
+    FindNext,
+    FindPrev,
+    /// Search the document's bookmarks.
+    Bookmarks,
     Open,
     Save,
     Export,
@@ -59,6 +65,8 @@ impl Action {
                 | Action::NextPage
                 | Action::ScreenUp
                 | Action::ScreenDown
+                | Action::FindNext
+                | Action::FindPrev
         )
     }
 
@@ -170,6 +178,14 @@ pub const BINDINGS: &[Binding] = &[
     b(Key::Space, M::Shift, A::ScreenUp),
     b(Key::Home, M::None, A::FirstPage),
     b(Key::End, M::None, A::LastPage),
+    // Find
+    b(Key::Slash, M::AnyShift, A::Find),
+    b(Key::F, M::Ctrl, A::Find),
+    b(Key::N, M::None, A::FindNext),
+    b(Key::N, M::Shift, A::FindPrev),
+    b(Key::F3, M::None, A::FindNext),
+    b(Key::F3, M::Shift, A::FindPrev),
+    b(Key::B, M::None, A::Bookmarks),
     // File
     b(Key::O, M::None, A::Open),
     b(Key::S, M::None, A::Save),
@@ -251,6 +267,14 @@ pub const HELP: &[(&str, &[HelpRow])] = &[
         ],
     ),
     (
+        "Find",
+        &[
+            row(&[A::Find], "Find in document"),
+            row(&[A::FindNext, A::FindPrev], "Next / previous match"),
+            row(&[A::Bookmarks], "Search bookmarks"),
+        ],
+    ),
+    (
         "File",
         &[
             row(&[A::Open], "Open"),
@@ -277,6 +301,7 @@ pub const MOUSE_HELP: &[(&str, &str)] = &[
     ("Back · Forward buttons", "Previous / next page"),
     ("Shift while drawing", "Straight line"),
     ("Enter · Shift+Enter", "Finish text · new line"),
+    ("Enter · Shift+Enter in find", "Next / previous match"),
 ];
 
 /// Keycap labels for the primary binding of `action`: e.g. `["Shift", "Z"]`.
@@ -309,6 +334,7 @@ pub fn key_name(key: Key) -> &'static str {
         Key::Equals => "=",
         Key::Minus => "−",
         Key::Questionmark => "?",
+        Key::Slash => "/",
         Key::PageDown => "PgDn",
         Key::PageUp => "PgUp",
         Key::Escape => "Esc",

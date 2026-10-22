@@ -20,6 +20,12 @@ pub enum Icon {
     Export,
     Help,
     Rotate,
+    Search,
+    Bookmark,
+    /// Chevrons pointing up / down (previous / next match).
+    Up,
+    Down,
+    Close,
 }
 
 /// Draws polylines in 24-unit icon space.
@@ -230,6 +236,25 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 )
             };
             c.line(&[back(3.2, 2.6), end, back(3.2, -2.6)]);
+        }
+        Icon::Search => {
+            c.circle((10.4, 10.4), 6.4);
+            c.line(&[(15.1, 15.1), (20.2, 20.2)]);
+        }
+        Icon::Bookmark => {
+            c.closed(&[
+                (6.5, 3.8),
+                (17.5, 3.8),
+                (17.5, 20.4),
+                (12.0, 15.6),
+                (6.5, 20.4),
+            ]);
+        }
+        Icon::Up => c.line(&[(6.4, 14.8), (12.0, 9.2), (17.6, 14.8)]),
+        Icon::Down => c.line(&[(6.4, 9.2), (12.0, 14.8), (17.6, 9.2)]),
+        Icon::Close => {
+            c.line(&[(7.0, 7.0), (17.0, 17.0)]);
+            c.line(&[(17.0, 7.0), (7.0, 17.0)]);
         }
     }
 }
