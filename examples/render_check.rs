@@ -49,7 +49,7 @@ fn main() {
     // Sanity: a rendered text page should not be uniformly one colour.
     let full = bitmap.as_rgba_bytes();
     let first = &full[0..4];
-    let uniform = full.chunks_exact(4).all(|px| px == first);
+    let uniform = full.as_chunks::<4>().0.iter().all(|px| px == first);
     println!("uniform-colour image: {uniform} (expect false for a real page)");
 
     // A region of the page, as PdfDoc::render_region (page-local points, top-left origin).
