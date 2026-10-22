@@ -1,6 +1,6 @@
 # Lint and test, then build the release binaries: a Linux AppImage and a portable Windows
 # exe, each carrying its own pdfium. Pushing a `v*` tag (matching Cargo.toml's version, e.g.
-# v0.2.0) also publishes both as a GitHub release.
+# v1.0.0) also publishes both as a GitHub release.
 
 name: Build
 
