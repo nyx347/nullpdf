@@ -634,14 +634,15 @@ impl App {
                             ui.add_space(4.0);
                             ui.label(RichText::new(err).size(12.5).color(theme::TEXT_DIM));
                             ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(
-                                    "Install pdfium (e.g. the pdfium-binaries package) \
-                                         and start nullpdf again.",
-                                )
-                                .size(13.0)
-                                .color(theme::TEXT),
-                            );
+                            let hint = if cfg!(feature = "bundled-pdfium") {
+                                "This build carries its own pdfium and unpacks it into \
+                                     your local cache folder: check that the folder is \
+                                     writable and start nullpdf again."
+                            } else {
+                                "Install pdfium (e.g. the pdfium-binaries package) \
+                                     and start nullpdf again."
+                            };
+                            ui.label(RichText::new(hint).size(13.0).color(theme::TEXT));
                         });
                         return;
                     }

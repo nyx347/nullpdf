@@ -16,6 +16,12 @@ skrifa = "0.40"
 # Accent-insensitive bookmark search; already built for egui-winit's link handling (url/idna).
 icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 
+[features]
+# Compile the pdfium library at NULLPDF_PDFIUM_LIB (an absolute path) into the binary, so it
+# runs without a separate libpdfium: the portable Windows exe. Unpacked to the user's cache
+# dir on start.
+bundled-pdfium = []
+
 [profile.dev]
 opt-level = 1
 

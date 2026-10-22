@@ -1,0 +1,4 @@
+# Link the C runtime statically on Windows, so nullpdf.exe runs without the VC++
+# redistributable installed (the bundled pdfium.dll needs only system DLLs too).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

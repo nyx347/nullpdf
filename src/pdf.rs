@@ -1,4 +1,4 @@
-//! PDF loading, page rendering and flattened export via the system Pdfium library.
+//! PDF loading, page rendering and flattened export via the Pdfium library.
 //!
 //! Rendering keeps one texture per page. Pages get a texture as soon as they scroll into
 //! view; once the view settles, each visible page is re-rendered at *exactly* its on-screen
@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use egui::{Context, Pos2, Rect, TextureHandle, TextureId, TextureOptions, Vec2};
@@ -178,9 +178,18 @@ pub struct FilledShape {
 }
 
 impl PdfDoc {
-    /// Bind to the system `libpdfium` once, returning a leaked `'static` handle.
-    pub fn init_pdfium() -> Result<&'static Pdfium, PdfiumError> {
-        let bindings = Pdfium::bind_to_system_library()?;
+    /// Bind to `libpdfium` once, returning a leaked `'static` handle. A copy shipped with the
+    /// app wins over the system's: the one embedded in the binary (`bundled-pdfium`, the
+    /// portable Windows build), else one beside the executable or in `../lib` (the AppImage).
+    pub fn init_pdfium() -> Result<&'static Pdfium, String> {
+        #[cfg(feature = "bundled-pdfium")]
+        let bindings = Pdfium::bind_to_library(unpack_embedded_pdfium()?);
+        #[cfg(not(feature = "bundled-pdfium"))]
+        let bindings = match shipped_pdfium() {
+            Some(path) => Pdfium::bind_to_library(path),
+            None => Pdfium::bind_to_system_library(),
+        };
+        let bindings = bindings.map_err(|e| e.to_string())?;
         Ok(Box::leak(Box::new(Pdfium::new(bindings))))
     }
 
@@ -612,6 +621,68 @@ impl PdfDoc {
 
         doc.save_to_file(out)
     }
+}
+
+/// A pdfium library packaged alongside the executable: beside it, or in `../lib` as in the
+/// AppImage's `usr/bin` + `usr/lib`.
+#[cfg(not(feature = "bundled-pdfium"))]
+fn shipped_pdfium() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [dir.to_path_buf(), dir.join("../lib")]
+        .iter()
+        .map(Pdfium::pdfium_platform_library_name_at_path)
+        .find(|p| p.is_file())
+}
+
+/// The pdfium library compiled into the binary (path in `NULLPDF_PDFIUM_LIB` at build time).
+#[cfg(feature = "bundled-pdfium")]
+static EMBEDDED_PDFIUM: &[u8] = include_bytes!(env!(
+    "NULLPDF_PDFIUM_LIB",
+    "set NULLPDF_PDFIUM_LIB to the absolute path of the pdfium library to embed"
+));
+
+/// Writes the embedded pdfium to the per-user cache dir, since only a file can be loaded.
+/// The name is keyed by the contents, so builds with different pdfiums never clash, and an
+/// identical copy (from an earlier run, or locked by a running instance) is reused as is.
+#[cfg(feature = "bundled-pdfium")]
+fn unpack_embedded_pdfium() -> Result<PathBuf, String> {
+    use std::env::consts::DLL_SUFFIX;
+    use std::hash::{DefaultHasher, Hasher};
+
+    let var = |k| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let cache = if cfg!(windows) {
+        var("LOCALAPPDATA").or_else(|| Some(std::env::temp_dir()))
+    } else {
+        var("XDG_CACHE_HOME").or_else(|| var("HOME").map(|h| h.join(".cache")))
+    };
+    let dir = cache
+        .ok_or("no per-user cache directory to unpack pdfium into")?
+        .join("nullpdf");
+    let mut hash = DefaultHasher::new();
+    hash.write(EMBEDDED_PDFIUM);
+    let path = dir.join(format!("pdfium-{:016x}{DLL_SUFFIX}", hash.finish()));
+
+    let current = || std::fs::read(&path).is_ok_and(|b| b == EMBEDDED_PDFIUM);
+    if current() {
+        return Ok(path);
+    }
+    let failed = |e: std::io::Error| format!("couldn't unpack pdfium to {}: {e}", dir.display());
+    std::fs::create_dir_all(&dir).map_err(failed)?;
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let written = std::fs::write(&tmp, EMBEDDED_PDFIUM).and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        // Another instance may have just put the same file in place (and locked it).
+        if !current() {
+            return Err(failed(e));
+        }
+    }
+    Ok(path)
 }
 
 /// The document's bookmarks, depth-first (each before its children). Bookmarks pointing

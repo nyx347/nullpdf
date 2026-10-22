@@ -24,6 +24,10 @@ cargo run --example export_check -- <in.pdf> <out.pdf> <out.png>
 cargo run --example search_check -- <in.pdf> <query> <out.png>
 
 cargo test                      # unit tests for the pure search logic (src/search.rs)
+
+# Release packages (what CI builds), each carrying its own pdfium:
+scripts/build-appimage.sh <unpacked pdfium-linux-x64>   # dist/nullpdf-<ver>-x86_64.AppImage
+NULLPDF_PDFIUM_LIB=<abs path to pdfium.dll> cargo build --release --features bundled-pdfium
 ```
 
 The only unit tests cover `search.rs` (match stepping/wrapping, bookmark filtering and
@@ -35,11 +39,22 @@ whole-page render; `export_check` covers strokes, highlights, dots, embedded-fon
 glyph outlines; `search_check` checks every match rectangle against the rendered ink (try a
 page with `/Rotate` or an offset crop box) and prints the outline with resolved targets.
 
-**Runtime requirement:** the system `libpdfium` must be installed and discoverable
-(`Pdfium::bind_to_system_library`). If it's missing the app still launches but the welcome
+**Runtime requirement:** `libpdfium` must be found (`PdfDoc::init_pdfium`). A copy shipped
+with the app wins: with the `bundled-pdfium` feature the library is compiled into the binary
+and unpacked to the user's cache dir on start (keyed by its contents); otherwise one beside
+the executable or in `../lib` (the AppImage's `usr/bin` + `usr/lib`), else the system's
+(`Pdfium::bind_to_system_library`). If none loads the app still launches but the welcome
 screen explains that libpdfium couldn't be loaded, and documents can't be opened. File
 dialogs (`rfd`) use the XDG desktop portal on Linux; without one, the app says so instead
 of failing silently (drag-and-drop and the CLI argument still work).
+
+**CI/CD** (`.github/workflows/build.yml`, every push): fmt + clippy + tests, then a Linux
+AppImage (built in an `ubuntu:22.04` container so it runs on glibc ≥ 2.35; icon and desktop
+entry in `packaging/`) and a portable single-file Windows exe (`bundled-pdfium`, C runtime
+linked statically via `.cargo/config.toml`). Pushing a `v*` tag equal to Cargo.toml's
+version publishes both as a GitHub release, with pdfium's licenses. pdfium comes from
+bblanchon/pdfium-binaries at `PDFIUM_VERSION`, which must match the API version
+pdfium-render's `pdfium_latest` binds: bump the two together.
 
 ## Architecture
 
