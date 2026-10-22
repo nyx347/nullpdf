@@ -4,7 +4,7 @@
 # PKGBUILD lives in). Use scripts/build-pkg.sh, or run `makepkg -f` here directly.
 
 pkgname=nullpdf
-pkgver=0.2.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc='Minimal PDF reader focused on freehand drawing and text annotation'
 arch=('x86_64')
