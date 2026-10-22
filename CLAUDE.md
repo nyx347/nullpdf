@@ -49,9 +49,10 @@ dialogs (`rfd`) use the XDG desktop portal on Linux; without one, the app says s
 of failing silently (drag-and-drop and the CLI argument still work).
 
 **CI/CD** (`.github/workflows/build.yml`, every push): fmt + clippy + tests, then a Linux
-AppImage (built in an `ubuntu:22.04` container so it runs on glibc ≥ 2.35; icon and desktop
-entry in `packaging/`) and a portable single-file Windows exe (`bundled-pdfium`, C runtime
-linked statically via `.cargo/config.toml`). Pushing a `v*` tag equal to Cargo.toml's
+AppImage (built in an `ubuntu:22.04` container so it runs on glibc ≥ 2.35; desktop entry in
+`packaging/`) and a portable single-file Windows exe (`bundled-pdfium`, C runtime linked
+statically via `.cargo/config.toml`, icon and version info linked in by `build.rs`). Both
+icons are drawn by `packaging/render-icon.py` from `icons::app_icon`'s design. Pushing a `v*` tag equal to Cargo.toml's
 version publishes both as a GitHub release, with pdfium's licenses. pdfium comes from
 bblanchon/pdfium-binaries at `PDFIUM_VERSION`, which must match the API version
 pdfium-render's `pdfium_latest` binds: bump the two together.

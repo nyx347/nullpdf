@@ -94,9 +94,16 @@ jobs:
       # pdfium.dll is compiled into the exe (and the C runtime linked statically, see
       # .cargo/config.toml), so the one file runs on a stock Windows install.
       - run: cargo build --release --locked --features bundled-pdfium
-      - name: Name the exe
+      - name: Check and name the exe
         run: |
           version="$(awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml)"
+          # build.rs links in the icon and version info: make sure they made it.
+          embedded="$(powershell -NoProfile -Command \
+            '(Get-Item target/release/nullpdf.exe).VersionInfo.ProductVersion' | tr -d '\r')"
+          if [[ "$embedded" != "$version" ]]; then
+            echo "::error::nullpdf.exe lacks its version resource (got '$embedded')"
+            exit 1
+          fi
           mkdir dist
           cp target/release/nullpdf.exe "dist/nullpdf-$version-windows-x86_64.exe"
       - uses: actions/upload-artifact@v7
