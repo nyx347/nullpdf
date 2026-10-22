@@ -1,5 +1,7 @@
-//! Painting the document: page shadows and textures, strokes, text, the live stroke
-//! preview, hover feedback, custom cursors and the rotation readout.
+//! Painting the document: page shadows and textures, search matches, strokes, text, the
+//! live stroke preview, hover feedback, custom cursors and the rotation readout.
+
+use std::ops::Range;
 
 use egui::epaint::{Mesh, TextShape, Vertex};
 use egui::{
@@ -35,6 +37,7 @@ impl App {
         for i in visible.clone() {
             self.paint_page(painter, i, ppp);
         }
+        self.paint_search_hits(painter, visible.clone());
 
         for s in &self.set.strokes {
             if visible.contains(&s.page) {
@@ -132,6 +135,45 @@ impl App {
         }
         if let Some((img, region)) = pdf.and_then(|p| p.tile_image(i)) {
             self.paint_image(painter, i, &img, region, ppp);
+        }
+    }
+
+    /// Tint every search match on the visible pages, the current one stronger and outlined.
+    /// Pdfium's boxes hug the glyphs, so they're padded to cover ascenders and descenders.
+    fn paint_search_hits(&self, painter: &Painter, visible: Range<usize>) {
+        let Some(search) = &self.search else {
+            return;
+        };
+        let pad = |r: &Rect| {
+            let across = r.width().min(r.height()) * 0.25;
+            if r.width() >= r.height() {
+                r.expand2(Vec2::new(1.0, across))
+            } else {
+                r.expand2(Vec2::new(across, 1.0))
+            }
+        };
+        for i in visible {
+            let Some(hits) = search.page(i) else {
+                continue;
+            };
+            let offset = self.layout.page_rect(i).min.to_vec2();
+            let current = search
+                .current
+                .filter(|c| c.0 == i)
+                .map(|c| hits.hits[c.1].clone());
+            for (k, r) in hits.rects.iter().enumerate() {
+                let quad = self.doc_quad(pad(r).translate(offset));
+                if current.as_ref().is_some_and(|c| c.contains(&k)) {
+                    painter.add(Shape::convex_polygon(
+                        quad.clone(),
+                        theme::SEARCH_CURRENT,
+                        Stroke::NONE,
+                    ));
+                    painter.add(Shape::closed_line(quad, theme::line(1.5, theme::ACCENT)));
+                } else {
+                    painter.add(Shape::convex_polygon(quad, theme::SEARCH_HIT, Stroke::NONE));
+                }
+            }
         }
     }
 

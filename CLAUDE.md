@@ -21,13 +21,19 @@ cargo fmt                       # format
 # Headless smoke tests (verify the pdfium pipeline without a GUI/Wayland screenshot):
 cargo run --example render_check -- <in.pdf> <page_index> <out.png>
 cargo run --example export_check -- <in.pdf> <out.pdf> <out.png>
+cargo run --example search_check -- <in.pdf> <query> <out.png>
+
+cargo test                      # unit tests for the pure search logic (src/search.rs)
 ```
 
-There is no unit-test suite. The two `examples/` are the verification harness — they
-deliberately mirror the exact pdfium calls in `src/pdf.rs`, so if you change rendering or
-export, update the corresponding example and run it to confirm against a real PDF.
-`render_check` also verifies that detail tiles register exactly with a whole-page render;
-`export_check` covers strokes, highlights, dots, embedded-font text and glyph outlines.
+The only unit tests cover `search.rs` (match stepping/wrapping, bookmark filtering and
+ranking), which needs no pdfium. Otherwise the three `examples/` are the verification
+harness — they deliberately mirror the exact pdfium calls in `src/pdf.rs`, so if you change
+rendering, export or search, update the corresponding example and run it to confirm against
+a real PDF. `render_check` also verifies that detail tiles register exactly with a
+whole-page render; `export_check` covers strokes, highlights, dots, embedded-font text and
+glyph outlines; `search_check` checks every match rectangle against the rendered ink (try a
+page with `/Rotate` or an offset crop box) and prints the outline with resolved targets.
 
 **Runtime requirement:** the system `libpdfium` must be installed and discoverable
 (`Pdfium::bind_to_system_library`). If it's missing the app still launches but the welcome
@@ -39,7 +45,8 @@ of failing silently (drag-and-drop and the CLI argument still work).
 
 The whole app is one `eframe::App` whose `ui()` runs every frame: reload check → drops /
 close request → keyboard → canvas (pointer gestures → camera glide + clamp → page textures
-→ paint) → text editor overlay → floating chrome → autosave → repaint scheduling. State
+→ paint) → text editor overlay → floating chrome → search tick → autosave → repaint
+scheduling. State
 lives in the `App` struct; there is no separate event loop or message bus. Every user
 command is an `Action` (`keymap.rs`) run through `App::dispatch`, whether it came from a
 key or a toolbar click.
@@ -55,13 +62,20 @@ Module responsibilities:
   - `app/text.rs` — text layout and hit-testing, the in-place editor, and the text/glyph
     data the exporter burns in.
   - `app/chrome.rs` — floating toolbar, status line, toasts, `?` sheet, welcome screen,
-    drop overlay.
+    drop overlay; its widget helpers (`pill`, `icon_button_sized`, `tooltip`, `keycap`)
+    are shared with the two below.
+  - `app/find.rs` — the find bar, driving the incremental text search each frame, and
+    stepping/revealing matches.
+  - `app/bookmarks.rs` — the bookmark palette (filter field + list over the outline).
 - `keymap.rs` — `Action`, the `BINDINGS` table (single source of truth for both key
   handling and the `?` cheat sheet) and the cheat-sheet layout.
 - `view.rs` — `Camera` (pan/zoom/free-rotation, clamp, glide), `Layout` (continuous
   vertical page stack), rotation snapping.
 - `pdf.rs` — `PdfDoc`: pdfium loading, the page texture cache (exact-resolution,
-  budgeted, detail tiles, eviction), flattened-PDF export.
+  budgeted, detail tiles, eviction), flattened-PDF export, per-page text search
+  (`find_text`) and the outline (`outline`, `dest_offset`).
+- `search.rs` — `TextSearch` (per-page results, the current match, next/previous that can
+  wait on unsearched pages) and `OutlineQuery` (bookmark filtering, ranking, highlights).
 - `annotation.rs` — `Stroke`/`TextAnnotation`/`AnnotationSet` data model, JSON sidecar I/O,
   `chaikin` smoothing, `simplify` (RDP), and `History` (undo/redo).
 - `tools.rs` — `Tool`, palette and size ladders, `Brush`, and in-flight `Gesture` /
@@ -82,6 +96,10 @@ Three spaces, converted via `view.rs`. Get these right or strokes land in the wr
 The camera stores the doc point shown at the viewport *centre* plus zoom + free rotation;
 panning/zooming/rotating all preserve that invariant. Note pdfium page space is y-up
 (bottom-left origin), so export flips: `y_pt = (1.0 - n[1]) * h` — see `to_pt` in `pdf.rs`.
+What pdfium *reads back* (search-match boxes, bookmark targets) is in the page's raw user
+space, which may also be offset by the crop box and turned by `/Rotate`; `UserToPage` in
+`pdf.rs` converts it to page-local points (top-left origin, as rendered) using pdfium's own
+page-to-device transform. Don't use the simple flip for those.
 
 The floating chrome covers parts of the viewport, so fitting, paging and clamping work on
 `App::safe_rect()` (the viewport minus toolbar/status space when they're shown).
@@ -96,6 +114,15 @@ palette colour, **[ ]** step the size of whatever the toolbar's size control sho
 highlighter width, font size, eraser radius). Picking a colour while navigating or erasing
 picks up the drawing tool.
 
+Find: `/` or Ctrl+F opens the find bar (bottom right, in the status line's strip) and
+searches as you type, from the reading position (or from the current match when the query
+is refined); Enter / Shift+Enter step through matches, gliding each into view; a click on
+the document leaves the field so `N` / Shift+N (or F3) step instead; Esc closes it and
+clears the highlights (`N` with the bar closed repeats the last search). `B` opens the
+bookmark palette on the section being read: typing filters (every word must match the
+title or an enclosing bookmark's; case- and, for plain letters, accent-insensitive), ↑ ↓
+choose, Enter goes there with the target at the top of the view.
+
 Anywhere: right-drag rotates (5° axis snap, Shift = 15° steps), middle-drag or Space+drag
 pans, wheel scrolls through the page stack (doc space, regardless of rotation), Ctrl+wheel
 or pinch zooms at the pointer. Shift while drawing makes a straight line, snapped to the
@@ -107,10 +134,12 @@ Space/Shift+Space screen, Home/End. Fit width/page is a *mode* (`Fit`): resizing
 or toggling the chrome re-fits until the user zooms by hand. Files: `O` open, `S` save,
 `X` export (Ctrl+O/S/E too). `Z`/Shift+Z undo/redo (Ctrl variants too); an undo of an
 off-screen change glides it into view. `?` shows every binding, `Tab` hides the chrome,
-`Esc` cancels the gesture/editor or returns to Navigate.
+`Esc` cancels (in order) the gesture, the text editor, the bookmark palette, the find bar,
+or returns to Navigate.
 
-While a text editor has focus, bare keys are typing: `keymap::lookup` only honours Ctrl
-bindings then (not undo/redo, which belong to the editor). In the editor, Enter commits,
+While a text field has focus (the annotation editor, the find field or the bookmark
+filter), bare keys are typing: `keymap::lookup` only honours Ctrl bindings then (not
+undo/redo, which belong to the field). In the editor, Enter commits,
 Shift+Enter starts a new line, Esc cancels, a click elsewhere commits.
 
 Annotations are a tagged `Annotation` enum (`Stroke` | `Text`) sharing one id space, so
@@ -135,6 +164,10 @@ on undo so the stacking order is restored).
   per-frame.
 - **Strokes** use `canvas::paint_polyline`, a tessellator with round caps and joins and a
   1px feathered edge, so the screen matches the exported PDF's round-capped paths.
+- **Text search** runs a few pages per frame (`SEARCH_BUDGET`), starting at the reading
+  position; `TextSearch::next_page` picks the page the current match or a pending step
+  waits on first, so results near the reader (and next/previous) come at once even in long
+  documents. Matches are painted over the page, under annotations.
 - **Idle means zero frames**: nothing polls. A watcher thread (`FileWatch`) stats the open
   PDF and only requests a repaint when its mtime changes; animations, pending renders,
   toast fades and autosave schedule their own repaints.
@@ -164,12 +197,17 @@ undo/redo keys off it.
   leaked for the app's lifetime — don't try to store both in a struct normally.
 - **Keep the chrome non-focusable.** Toolbar widgets use `Sense::CLICK` (no `FOCUSABLE`)
   and `raw_input_hook` strips Tab, so no widget can take keyboard focus and swallow the
-  single-key shortcuts. Typing is detected with `ctx.text_edit_focused()`, not
-  `egui_wants_keyboard_input()` (which is true for *any* focused widget).
+  single-key shortcuts. The only focusable widgets are the three text fields (annotation
+  editor, find field, bookmark filter; the latter two use `lock_focus` so Tab can't move
+  focus). Typing is detected with `ctx.text_edit_focused()`, not
+  `egui_wants_keyboard_input()` (which is true for *any* focused widget). Since
+  `SurrenderFocusOn::Never` is set, a press on the canvas explicitly blurs the find field
+  (`blur_find`) so single keys work again.
 - **Pointer gestures come from raw events** (`Event::PointerButton`/`PointerMoved`), not
   egui's drag detection, which only reports a drag after ~6px — that would clip the start
   of every stroke and make taps impossible. Use the modifiers carried by the button event
-  at release (Shift and the button often come up in the same frame).
+  at release (Shift and the button often come up in the same frame). The same goes for keys
+  the UI reads itself, e.g. Shift+Enter in the find field (`enter_steps`).
 - **WYSIWYG smoothing**: freehand input is Chaikin-smoothed (2 iterations) on finalize, and
   the in-progress preview applies the *same* smoothing so committed ink matches the preview;
   `simplify` then drops redundant points with a sub-pixel tolerance.
@@ -178,6 +216,7 @@ undo/redo keys off it.
 - **Auto-reload** keeps in-memory annotations and the old page pixels (`adopt_textures`)
   until fresh renders replace them. It's deferred mid-gesture; a partial write fails the
   re-open and is retried shortly. Annotations on pages beyond a shrunken page count are
-  kept but not drawn or hit-tested.
+  kept but not drawn or hit-tested. An open search restarts (from its current match) and
+  an open bookmark palette re-filters; opening another file closes both.
 - egui's `ctx.input(|i| …)` holds the context lock: read what you need inside the closure,
   then act after it (`handle_keyboard` collects `Action`s and dispatches them afterwards).

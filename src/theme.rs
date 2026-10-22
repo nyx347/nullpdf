@@ -23,6 +23,11 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(150, 151, 160);
 pub const TEXT_FAINT: Color32 = Color32::from_rgb(92, 93, 102);
 /// Focus / selection accent (also the text caret, which must read on white paper).
 pub const ACCENT: Color32 = Color32::from_rgb(64, 132, 255);
+/// The accent as text on a chrome surface (matched letters in a search list).
+pub const ACCENT_TEXT: Color32 = Color32::from_rgb(122, 172, 255);
+/// Search matches on the page, and the current one.
+pub const SEARCH_HIT: Color32 = Color32::from_rgba_unmultiplied_const(64, 132, 255, 64);
+pub const SEARCH_CURRENT: Color32 = Color32::from_rgba_unmultiplied_const(64, 132, 255, 120);
 /// Errors.
 pub const DANGER: Color32 = Color32::from_rgb(255, 99, 92);
 /// Page placeholder while its texture renders (paper, not a dark hole).

@@ -2,8 +2,9 @@
 //!
 //! Single-key tools: `Q` navigate, `D` pen, `H` highlighter, `E` eraser, `T` text; Shift
 //! draws straight lines, right-drag free-rotates (5° axis snap), wheel scrolls and
-//! ctrl+wheel zooms. `?` shows every shortcut. Annotations (strokes + text) live in a
-//! `<pdf>.nullpdf.json` sidecar that is saved automatically.
+//! ctrl+wheel zooms. `/` searches the text, `B` the bookmarks, and `?` shows every shortcut.
+//! Annotations (strokes + text) live in a `<pdf>.nullpdf.json` sidecar that is saved
+//! automatically.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -12,6 +13,7 @@ mod app;
 mod icons;
 mod keymap;
 mod pdf;
+mod search;
 mod theme;
 mod tools;
 mod view;
