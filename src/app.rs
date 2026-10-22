@@ -1,77 +1,282 @@
-//! The eframe application: wires the PDF renderer, camera, annotations and tools
-//! together, handles input, and paints the rotated page canvas + strokes.
+//! The eframe application: owns all state, runs the per-frame loop, and implements every
+//! action the keymap and toolbar can trigger.
+//!
+//! Frame order: poll for reload → drops/close → keyboard → canvas (pointer gestures →
+//! camera glide + clamp → page textures → paint) → text editor overlay → chrome → autosave.
+//! Submodules split the work: `input` (keyboard + pointer gestures), `canvas` (painting the
+//! document), `text` (text annotations: layout, editing, export runs) and `chrome` (the
+//! floating toolbar, status line, toasts, cheat sheet and welcome screen).
+
+mod canvas;
+mod chrome;
+mod input;
+mod text;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use egui::{Color32, Pos2, Rect, Sense, Stroke as EStroke};
+use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use pdfium_render::prelude::Pdfium;
 
-use crate::annotation::{
-    chaikin, Annotation, AnnotationSet, History, Stroke, StrokeKind, TextAnnotation,
+use crate::annotation::{Annotation, AnnotationSet, History, SidecarLoad};
+use crate::keymap::Action;
+use crate::pdf::{PageNeed, PdfDoc};
+use crate::theme;
+use crate::tools::{
+    step_size, Brush, Gesture, StyleTarget, TextEditing, Tool, ERASER_SIZES, FONT_SIZES,
+    HIGHLIGHT_ALPHA, PALETTE, STROKE_SIZES,
 };
-use crate::pdf::PdfDoc;
-use crate::tools::{ActiveStroke, Mode, TextDrag, TextEditing, Tools};
-use crate::view::{Camera, Layout, PageSize};
+use crate::view::{next_axis, Camera, Layout};
 
-/// Extra erase pick-radius beyond the stroke's own half-width, in doc points.
-const ERASE_SLOP: f32 = 4.0;
-
-/// Minimum movement (in normalised page units) before a new freehand sample is kept.
-const MIN_SAMPLE_DIST: f32 = 0.0012;
-
-/// How often to poll the open PDF's mtime for external changes.
+/// How often the watcher thread checks the open PDF's mtime for external changes.
 const RELOAD_POLL: Duration = Duration::from_millis(750);
 
-/// Multiplier applied to raw wheel scroll for a slightly brisker feel.
-const SCROLL_SPEED: f32 = 1.4;
+/// Unsaved annotations are written this long (s) after the last change.
+const AUTOSAVE_DELAY: f64 = 0.8;
+/// After a failed save, wait this long (s) before trying again.
+const SAVE_RETRY: f64 = 5.0;
 
-/// Maximum character width of a path shown in the status bar before middle-eliding.
-const STATUS_PATH_MAX: usize = 48;
+/// The view counts as settled (worth re-rendering crisply) after this long (s) unchanged.
+const SETTLE_TIME: f64 = 0.12;
+
+/// Keyboard zoom step.
+const ZOOM_STEP: f32 = 1.25;
+/// Arrow-key scroll step, in screen pixels.
+const ARROW_STEP: f32 = 64.0;
+/// Fraction of the view a Space/Shift+Space "screen" scroll moves.
+const SCREEN_STEP: f32 = 0.88;
+/// "Fit width" never zooms past this (screen px per point ≈ 135% of actual size), so pages
+/// on very wide windows stay readable instead of ballooning.
+const MAX_FIT_ZOOM: f32 = 1.8;
+/// Breathing room (screen px) kept around a fitted page.
+const FIT_MARGIN: f32 = 20.0;
+/// Space reserved at the top of the view for the floating toolbar, and at the bottom for the
+/// status line, when chrome is visible.
+const TOOLBAR_SPACE: f32 = theme::MARGIN + theme::BUTTON + 8.0 + 8.0;
+const STATUS_SPACE: f32 = theme::MARGIN + 26.0 + 4.0;
+
+/// Info toasts stay this long (s); errors longer. They fade in quickly and out gently.
+const TOAST_TIME: f64 = 2.2;
+const ERROR_TOAST_TIME: f64 = 6.0;
+const TOAST_FADE_IN: f64 = 0.15;
+const TOAST_FADE_OUT: f64 = 0.35;
+
+/// Zoom shown as 100% in the status line: one PDF point = one CSS pixel at 96 dpi, the
+/// "actual size" other viewers call 100%.
+const ACTUAL_SIZE_ZOOM: f32 = 96.0 / 72.0;
+
+/// A fit the view keeps re-applying — when the window is resized or the toolbar shows or
+/// hides — until the user zooms by hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fit {
+    Width,
+    Page,
+}
+
+/// Wakes the UI when the open PDF's modification time changes, so an idle app renders no
+/// frames at all instead of repainting just to poll. The UI thread still does the actual
+/// reload (`App::check_reload`); this only stats the file and requests a repaint.
+struct FileWatch {
+    path: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl FileWatch {
+    fn spawn(ctx: egui::Context) -> Self {
+        let path = Arc::new(Mutex::new(None::<PathBuf>));
+        let shared = Arc::clone(&path);
+        let _ = std::thread::Builder::new()
+            .name("nullpdf-watch".into())
+            .spawn(move || {
+                let mut last: Option<(PathBuf, Option<SystemTime>)> = None;
+                loop {
+                    std::thread::sleep(RELOAD_POLL);
+                    let Some(p) = shared.lock().ok().and_then(|g| g.clone()) else {
+                        last = None;
+                        continue;
+                    };
+                    let mtime = current_mtime(&p);
+                    if last
+                        .as_ref()
+                        .is_some_and(|(lp, lm)| *lp == p && *lm != mtime)
+                    {
+                        ctx.request_repaint();
+                    }
+                    last = Some((p, mtime));
+                }
+            });
+        Self { path }
+    }
+
+    fn watch(&self, path: Option<PathBuf>) {
+        if let Ok(mut g) = self.path.lock() {
+            *g = path;
+        }
+    }
+}
+
+struct Toast {
+    text: String,
+    error: bool,
+    born: f64,
+}
+
+impl Toast {
+    fn ttl(&self) -> f64 {
+        if self.error {
+            ERROR_TOAST_TIME
+        } else {
+            TOAST_TIME
+        }
+    }
+}
 
 pub struct App {
+    ctx: egui::Context,
     /// Leaked, app-lifetime Pdfium binding. `None` if the system library failed to load.
     pdfium: Option<&'static Pdfium>,
+    /// Why Pdfium failed to load, shown on the welcome screen.
+    pdfium_error: Option<String>,
     pdf: Option<PdfDoc>,
     pdf_path: Option<PathBuf>,
     /// Last-modified time of `pdf_path` when last loaded, for change detection.
     pdf_mtime: Option<SystemTime>,
+    watch: FileWatch,
+    /// A changed file couldn't be re-opened yet (likely mid-write); retry shortly.
+    reload_retry: bool,
     layout: Layout,
     set: AnnotationSet,
     history: History,
+
     cam: Camera,
-    tools: Tools,
+    /// Target of an in-flight animated camera move (keyboard zoom/scroll/page/rotate).
+    /// Direct manipulation cancels it; further keys build on the target, not the
+    /// mid-animation camera, so rapid presses accumulate exactly.
+    glide: Option<Camera>,
+    /// True until the first frame after opening has fitted the view.
+    needs_fit: bool,
+    /// The fit in force, and the visible area it was computed for.
+    fit: Option<Fit>,
+    fit_safe: Rect,
+    prev_cam: Camera,
+    /// When the camera last moved (for "settled" re-rendering).
+    view_changed_at: f64,
+    /// Canvas rect of the latest frame.
+    viewport: Rect,
 
-    /// Current pen colour (straight sRGBA); alpha distinguishes ink from highlight.
-    color: Color32,
-    width_pt: f32,
-    /// Current text font size in PDF points (Text mode).
-    font_pt: f32,
+    tool: Tool,
+    /// The drawing tool (Pen or Highlighter) the eraser toggles back to, and what colour
+    /// and size changes apply to while navigating.
+    last_draw: Tool,
+    pen: Brush,
+    highlighter: Brush,
+    /// Font size for new text (text uses the pen's colour).
+    text_size: f32,
+    /// Eraser radius in screen pixels.
+    eraser_px: f32,
 
-    status: String,
+    gesture: Gesture,
+    /// The pointer button that started `gesture`.
+    gesture_button: Option<egui::PointerButton>,
+    /// The open text editor, if any.
+    text_edit: Option<TextEditing>,
+    /// Space is held (spring-loaded pan) and whether it has been used to pan; a plain tap
+    /// scrolls a screen on release instead.
+    space_down: bool,
+    space_used: bool,
+    /// Tab is down (it is consumed in `raw_input_hook`, so egui never moves focus).
+    tab_down: bool,
+    /// Actions raised outside the keyboard handler (Tab, from `raw_input_hook`), run with
+    /// this frame's keys.
+    queued: Vec<Action>,
+
+    /// Annotations changed since the last successful save.
+    dirty: bool,
+    changed_at: f64,
+    /// When the last save failed (for retry back-off) and why (to avoid repeating toasts).
+    save_failed_at: Option<f64>,
+    save_error: Option<String>,
+    /// The existing sidecar could not be read; it is backed up before the first overwrite.
+    sidecar_unreadable: bool,
+    /// A close was refused because annotations couldn't be saved; the next close proceeds.
+    close_armed: bool,
+
+    chrome_visible: bool,
+    help_open: bool,
+    toast: Option<Toast>,
+    /// Window title last sent, to avoid resending every frame.
+    title: String,
+    /// `ctx.input(|i| i.time)` of the current frame.
+    now: f64,
+    /// Modifier keys held this frame.
+    mods: egui::Modifiers,
+    /// Wheel travel accumulated over the size control, stepped in whole rungs.
+    size_wheel: f32,
+    /// Unsnapped angle and last event time of a trackpad/touch rotation in progress.
+    twist: Option<(f32, f64)>,
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        let (pdfium, status) = match PdfDoc::init_pdfium() {
-            Ok(p) => (Some(p), String::from("Open a PDF (Ctrl+O).")),
-            Err(e) => (None, format!("Failed to load libpdfium: {e}")),
+    pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+        theme::install(&cc.egui_ctx);
+        let (pdfium, pdfium_error) = match PdfDoc::init_pdfium() {
+            Ok(p) => (Some(p), None),
+            Err(e) => (None, Some(e.to_string())),
         };
 
         let mut app = Self {
+            ctx: cc.egui_ctx.clone(),
             pdfium,
+            pdfium_error,
             pdf: None,
             pdf_path: None,
             pdf_mtime: None,
+            watch: FileWatch::spawn(cc.egui_ctx.clone()),
+            reload_retry: false,
             layout: Layout::default(),
             set: AnnotationSet::default(),
             history: History::default(),
             cam: Camera::default(),
-            tools: Tools::default(),
-            color: Color32::from_rgb(220, 40, 40),
-            width_pt: 3.0,
-            font_pt: 14.0,
-            status,
+            glide: None,
+            needs_fit: false,
+            fit: None,
+            fit_safe: Rect::NOTHING,
+            prev_cam: Camera::default(),
+            view_changed_at: 0.0,
+            viewport: Rect::ZERO,
+            tool: Tool::Nav,
+            last_draw: Tool::Pen,
+            pen: Brush {
+                color: PALETTE[1].1,
+                size: 3.0,
+            },
+            highlighter: Brush {
+                color: with_alpha(PALETTE[3].1, HIGHLIGHT_ALPHA),
+                size: 14.0,
+            },
+            text_size: 14.0,
+            eraser_px: 8.0,
+            gesture: Gesture::None,
+            gesture_button: None,
+            text_edit: None,
+            space_down: false,
+            space_used: false,
+            tab_down: false,
+            queued: Vec::new(),
+            dirty: false,
+            changed_at: 0.0,
+            save_failed_at: None,
+            save_error: None,
+            sidecar_unreadable: false,
+            close_armed: false,
+            chrome_visible: true,
+            help_open: false,
+            toast: None,
+            title: String::new(),
+            now: 0.0,
+            mods: egui::Modifiers::NONE,
+            size_wheel: 0.0,
+            twist: None,
         };
 
         if let Some(path) = initial {
@@ -80,69 +285,137 @@ impl App {
         app
     }
 
+    // --- feedback ----------------------------------------------------------------
+
+    fn notify(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            error: false,
+            born: self.now,
+        });
+    }
+
+    fn error(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            error: true,
+            born: self.now,
+        });
+    }
+
+    /// Short-lived confirmation of a style/tool change, only when the toolbar that would
+    /// otherwise show it is hidden.
+    fn hint(&mut self, text: impl Into<String>) {
+        if !self.chrome_visible {
+            self.notify(text);
+        }
+    }
+
+    fn file_name(&self) -> String {
+        self.pdf_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    // --- documents ---------------------------------------------------------------
+
     fn open_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("PDF", &["pdf"])
-            .pick_file()
-        {
-            self.open_path(&path);
+        let mut dialog = rfd::FileDialog::new().add_filter("PDF", &["pdf"]);
+        if let Some(dir) = self.pdf_path.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(dir);
+        }
+        let shown = std::time::Instant::now();
+        match dialog.pick_file() {
+            Some(path) => self.open_path(&path),
+            None => self.dialog_failed(shown, "open a file"),
+        }
+    }
+
+    /// The system file dialog returns nothing both when cancelled and when it couldn't be
+    /// shown at all (e.g. no xdg-desktop-portal). Nobody cancels within a blink, so an
+    /// instant "cancel" gets an explanation instead of silence.
+    fn dialog_failed(&mut self, shown: std::time::Instant, what: &str) {
+        if shown.elapsed() < Duration::from_millis(150) {
+            self.error(format!(
+                "Couldn't show a file dialog to {what} — is xdg-desktop-portal installed? \
+                 (PDFs can also be dropped on the window or passed on the command line)"
+            ));
         }
     }
 
     fn open_path(&mut self, path: &Path) {
         let Some(pdfium) = self.pdfium else {
-            self.status = "pdfium unavailable".into();
+            self.error("Can't open PDFs: libpdfium isn't available");
             return;
         };
-        match PdfDoc::open(pdfium, path) {
-            Ok(doc) => {
-                let sizes: Vec<PageSize> = doc.sizes.clone();
-                let page_count = sizes.len();
-                self.layout = Layout::new(sizes);
-                self.pdf = Some(doc);
-                self.pdf_path = Some(path.to_path_buf());
-
-                let file_name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                // Reload sidecar annotations if present and shaped for this document.
-                self.set = match AnnotationSet::load_for(path) {
-                    Some(s) if s.page_count == page_count => {
-                        self.status = format!("{file_name} — loaded annotations");
-                        s
-                    }
-                    Some(mut s) => {
-                        // Page count changed: keep strokes but warn (best-effort alignment).
-                        s.pdf_file = file_name.clone();
-                        self.status =
-                            format!("{file_name} — page count changed, annotations may shift");
-                        s
-                    }
-                    None => {
-                        self.status = format!("{file_name} — {page_count} pages");
-                        AnnotationSet::new(file_name, page_count)
-                    }
-                };
-                self.history = History::default();
-                self.cam.initialized = false;
-                self.tools.active = None;
-                self.pdf_mtime = current_mtime(path);
-            }
-            Err(e) => {
-                self.status = format!("Failed to open: {e}");
-            }
+        // Leaving the current document: finish edits (keeping a stroke in progress) and
+        // persist them first.
+        self.commit_text();
+        self.finish_gesture(true);
+        if !self.flush_save() {
+            return;
         }
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let doc = match PdfDoc::open(pdfium, path) {
+            Ok(doc) => doc,
+            Err(e) => {
+                self.error(format!("Couldn't open {name}: {e}"));
+                return;
+            }
+        };
+        let page_count = doc.sizes.len();
+        self.layout = Layout::new(doc.sizes.clone());
+        self.pdf = Some(doc);
+        self.pdf_path = Some(path.to_path_buf());
+        self.pdf_mtime = current_mtime(path);
+        self.watch.watch(Some(path.to_path_buf()));
+        self.reload_retry = false;
+        self.sidecar_unreadable = false;
+        self.toast = None;
+
+        self.set = match AnnotationSet::load_for(path) {
+            SidecarLoad::Loaded(mut s) => {
+                if s.page_count != page_count {
+                    self.error(format!(
+                        "{name} now has {page_count} pages (annotations were made on {}) — \
+                         some may be misplaced",
+                        s.page_count
+                    ));
+                }
+                s.pdf_file = name.clone();
+                s.page_count = page_count;
+                s
+            }
+            SidecarLoad::Missing => AnnotationSet::new(name.clone(), page_count),
+            SidecarLoad::Unreadable(e) => {
+                self.sidecar_unreadable = true;
+                self.error(format!(
+                    "Couldn't read saved annotations ({e}); the file will be kept as .bak"
+                ));
+                AnnotationSet::new(name.clone(), page_count)
+            }
+        };
+        self.history = History::default();
+        self.dirty = false;
+        self.save_failed_at = None;
+        self.save_error = None;
+        self.close_armed = false;
+        self.needs_fit = true;
+        self.glide = None;
+        self.gesture = Gesture::None;
+        self.text_edit = None;
     }
 
     /// Re-open the PDF (pages only) when the file changes on disk, preserving the
-    /// in-memory annotations (normalised, so they re-align) and the current view.
-    /// Skipped while a stroke is in progress to avoid disrupting drawing.
+    /// in-memory annotations (normalised, so they re-align), the view, and — until fresh
+    /// renders replace them — the old page pixels, so a rebuild-and-reload never flashes.
+    /// Deferred while a gesture is in progress, so drawing is never disrupted.
     fn check_reload(&mut self) {
-        if self.tools.active.is_some() {
-            return;
-        }
         let (Some(pdfium), Some(path)) = (self.pdfium, self.pdf_path.clone()) else {
             return;
         };
@@ -150,27 +423,35 @@ impl App {
             return;
         };
         if self.pdf_mtime == Some(new_mtime) {
+            self.reload_retry = false;
+            return;
+        }
+        if !self.gesture.is_none() {
+            self.reload_retry = true;
             return;
         }
         // File changed (or appeared): try to re-open. A partial write will fail here;
-        // we leave mtime untouched so the next tick retries once the writer finishes.
-        match PdfDoc::open(pdfium, &path) {
-            Ok(doc) => {
-                let sizes = doc.sizes.clone();
-                let page_count = sizes.len();
-                self.layout = Layout::new(sizes);
-                self.pdf = Some(doc);
-                self.pdf_mtime = Some(new_mtime);
-                if page_count != self.set.page_count {
-                    self.set.page_count = page_count;
-                    self.status = format!(
-                        "Auto-reloaded — page count now {page_count}, annotations may shift"
-                    );
-                } else {
-                    self.status = "Auto-reloaded (file changed on disk)".into();
-                }
-            }
-            Err(_) => { /* mid-write or transiently unreadable; retry next tick */ }
+        // we leave mtime untouched and retry shortly, once the writer finishes.
+        let Ok(mut doc) = PdfDoc::open(pdfium, &path) else {
+            self.reload_retry = true;
+            return;
+        };
+        self.reload_retry = false;
+        let page_count = doc.sizes.len();
+        if let Some(old) = self.pdf.take() {
+            doc.adopt_textures(old);
+        }
+        self.layout = Layout::new(doc.sizes.clone());
+        self.pdf = Some(doc);
+        self.pdf_mtime = Some(new_mtime);
+        if page_count != self.set.page_count {
+            self.error(format!(
+                "Reloaded — now {page_count} pages (was {}); annotations may be misplaced",
+                self.set.page_count
+            ));
+            self.set.page_count = page_count;
+        } else {
+            self.notify("Reloaded — the file changed on disk");
         }
     }
 
@@ -178,713 +459,795 @@ impl App {
         let (Some(pdfium), Some(src)) = (self.pdfium, self.pdf_path.clone()) else {
             return;
         };
+        self.commit_text();
+        self.finish_gesture(true);
         let default_name = src
             .file_stem()
             .map(|s| format!("{}-annotated.pdf", s.to_string_lossy()))
             .unwrap_or_else(|| "annotated.pdf".to_string());
-        if let Some(out) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
-            .set_file_name(default_name)
-            .save_file()
+            .set_file_name(default_name);
+        if let Some(dir) = src.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let shown = std::time::Instant::now();
+        let Some(mut out) = dialog.save_file() else {
+            self.dialog_failed(shown, "export");
+            return;
+        };
+        if out.extension().is_none() {
+            out.set_extension("pdf");
+        }
+        if same_file(&out, &src) {
+            self.error("Export to a different file — the open PDF stays untouched");
+            return;
+        }
+        let (runs, shapes, font) = self.export_text();
+        let strokes = &self.set.strokes;
+        match PdfDoc::export_flattened(pdfium, &src, &out, strokes, &runs, &shapes, &font) {
+            Ok(()) => {
+                let name = out.file_name().map(|s| s.to_string_lossy().into_owned());
+                self.notify(format!("Exported {}", name.unwrap_or_default()));
+            }
+            Err(e) => self.error(format!("Export failed: {e}")),
+        }
+    }
+
+    /// Write the sidecar now. A document with no annotations and no sidecar yet writes
+    /// nothing (no clutter next to PDFs that were only read).
+    fn save_now(&mut self) -> Result<(), String> {
+        let Some(path) = self.pdf_path.clone() else {
+            return Ok(());
+        };
+        let sidecar = AnnotationSet::sidecar_path(&path);
+        if self.set.is_empty() && !sidecar.exists() {
+            self.dirty = false;
+            return Ok(());
+        }
+        if self.sidecar_unreadable && sidecar.exists() {
+            let mut bak = sidecar.clone().into_os_string();
+            bak.push(".bak");
+            std::fs::rename(&sidecar, &bak).map_err(|e| e.to_string())?;
+        }
+        self.sidecar_unreadable = false;
+        self.set.page_count = self.layout.len();
+        self.set.save_for(&path).map_err(|e| e.to_string())?;
+        self.dirty = false;
+        self.save_failed_at = None;
+        self.save_error = None;
+        Ok(())
+    }
+
+    /// Explicit save (S / Ctrl+S).
+    fn save(&mut self) {
+        self.commit_text();
+        self.finish_gesture(true);
+        match self.save_now() {
+            Ok(()) => self.notify("Annotations saved"),
+            Err(e) => self.error(format!("Couldn't save annotations: {e}")),
+        }
+    }
+
+    /// Save if there are unsaved changes; on failure, say so and return `false`.
+    fn flush_save(&mut self) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        match self.save_now() {
+            Ok(()) => true,
+            Err(e) => {
+                self.error(format!("Couldn't save annotations: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Autosave shortly after edits settle (never mid-gesture or mid-typing).
+    fn autosave_tick(&mut self) {
+        if !self.dirty || !self.gesture.is_none() || self.text_edit.is_some() {
+            return;
+        }
+        if self.now - self.changed_at < AUTOSAVE_DELAY {
+            return;
+        }
+        if self
+            .save_failed_at
+            .is_some_and(|t| self.now - t < SAVE_RETRY)
         {
-            match PdfDoc::export_flattened(pdfium, &src, &out, &self.set.strokes, &self.set.texts) {
-                Ok(()) => self.status = format!("Exported flattened PDF → {}", elide_path(&out)),
-                Err(e) => self.status = format!("Export failed: {e}"),
-            }
-        }
-    }
-
-    fn save_sidecar(&mut self) {
-        if let Some(path) = self.pdf_path.clone() {
-            match self.set.save_for(&path) {
-                Ok(()) => self.status = "Saved annotations".into(),
-                Err(e) => self.status = format!("Save failed: {e}"),
-            }
-        }
-    }
-
-    /// Build a finished stroke from the active gesture and current pen settings.
-    fn finalize_stroke(&mut self, straight: bool) {
-        let Some(active) = self.tools.active.take() else {
-            return;
-        };
-        if active.points.len() < 2 {
             return;
         }
-        let (kind, points) = if straight {
-            (
-                StrokeKind::Line,
-                vec![active.points[0], *active.points.last().unwrap()],
-            )
-        } else {
-            // Smooth freehand strokes (Chaikin) so committed ink matches the preview.
-            (StrokeKind::Freehand, chaikin(&active.points, 2))
-        };
-        let stroke = Stroke {
-            page: active.page,
-            kind,
-            points,
-            color: self.color.to_srgba_unmultiplied(),
-            width_pt: self.width_pt,
-            id: 0,
-        };
-        let id = self.set.add(stroke);
-        // Record a clone carrying the assigned id for undo.
-        if let Some(s) = self.set.strokes.iter().find(|s| s.id == id) {
-            self.history.record_add(Annotation::Stroke(s.clone()));
-        }
-    }
-
-    /// Remove the topmost annotation (text first, then stroke) under `doc`.
-    fn erase_at(&mut self, ctx: &egui::Context, doc: Pos2) {
-        // Text sits visually on top of strokes, so prefer a text hit.
-        let mut hit = self.text_at_doc(ctx, doc);
-        if hit.is_none() {
-            for s in self.set.strokes.iter().rev() {
-                let thresh = s.width_pt * 0.5 + ERASE_SLOP;
-                if self.stroke_hit(s, doc, thresh) {
-                    hit = Some(s.id);
-                    break;
-                }
-            }
-        }
-        if let Some(id) = hit {
-            if let Some(removed) = self.set.remove(id) {
-                self.history.record_erase(removed);
+        if let Err(e) = self.save_now() {
+            self.save_failed_at = Some(self.now);
+            if self.save_error.as_deref() != Some(e.as_str()) {
+                self.error(format!("Couldn't save annotations: {e}"));
+                self.save_error = Some(e);
             }
         }
     }
 
-    /// True if `doc` lies within `thresh` points of any segment of stroke `s`.
-    fn stroke_hit(&self, s: &Stroke, doc: Pos2, thresh: f32) -> bool {
-        if s.points.is_empty() {
-            return false;
-        }
-        let pts: Vec<Pos2> = s
-            .points
-            .iter()
-            .map(|n| self.layout.norm_to_doc(s.page, *n))
-            .collect();
-        if pts.len() == 1 {
-            return pts[0].distance(doc) <= thresh;
-        }
-        pts.windows(2)
-            .any(|w| point_segment_distance(doc, w[0], w[1]) <= thresh)
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.changed_at = self.now;
+        self.close_armed = false;
     }
 
-    // --- text ------------------------------------------------------------------
+    // --- styles --------------------------------------------------------------------
 
-    /// Axis-aligned bounding box of a text annotation in doc space. Text is laid out at
-    /// its point size, so the galley's size in egui points equals its extent in PDF points.
-    fn text_bbox_doc(&self, ctx: &egui::Context, t: &TextAnnotation) -> Rect {
-        let anchor = self.layout.norm_to_doc(t.page, t.pos);
-        let galley = ctx.fonts_mut(|f| {
-            f.layout_no_wrap(
-                t.text.clone(),
-                egui::FontId::proportional(t.size_pt.max(1.0)),
-                Color32::WHITE,
-            )
-        });
-        Rect::from_min_size(anchor, galley.size())
-    }
-
-    /// Id of the topmost text annotation whose box contains doc point `doc`, if any.
-    fn text_at_doc(&self, ctx: &egui::Context, doc: Pos2) -> Option<u64> {
-        self.set
-            .texts
-            .iter()
-            .rev()
-            .find(|t| self.text_bbox_doc(ctx, t).contains(doc))
-            .map(|t| t.id)
-    }
-
-    fn handle_text(&mut self, ctx: &egui::Context, response: &egui::Response, viewport: Rect) {
-        // Finish editing before starting any new gesture (a click outside the editor
-        // commits it via lost-focus in `text_overlay`); ignore canvas input meanwhile.
-        if self.tools.text_edit.is_some() {
-            return;
+    /// What colour/size changes apply to right now.
+    fn style_target(&self) -> StyleTarget {
+        if self.text_edit.is_some() || self.tool == Tool::Text {
+            return StyleTarget::Text;
         }
-        let primary = egui::PointerButton::Primary;
+        match self.tool {
+            Tool::Highlighter => StyleTarget::Highlighter,
+            Tool::Pen => StyleTarget::Pen,
+            _ if self.last_draw == Tool::Highlighter => StyleTarget::Highlighter,
+            _ => StyleTarget::Pen,
+        }
+    }
 
-        // Begin dragging an existing text.
-        if response.drag_started_by(primary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let doc = self.cam.screen_to_doc(pos, viewport);
-                if let Some(id) = self.text_at_doc(ctx, doc) {
-                    if let Some(t) = self.set.text_by_id(id) {
-                        let anchor = self.layout.norm_to_doc(t.page, t.pos);
-                        self.tools.text_drag = Some(TextDrag {
-                            id,
-                            before: t.clone(),
-                            grab: doc - anchor,
-                        });
+    /// The colour the toolbar shows as selected.
+    fn current_color(&self) -> Color32 {
+        match self.style_target() {
+            StyleTarget::Text => self
+                .text_edit
+                .as_ref()
+                .map_or(self.pen.color, |te| te.color),
+            StyleTarget::Highlighter => self.highlighter.color,
+            StyleTarget::Pen => self.pen.color,
+        }
+    }
+
+    /// Apply a colour to the current style target. Picking a colour while navigating or
+    /// erasing picks up the drawing tool, ready to draw with it.
+    fn set_color(&mut self, color: Color32, from_palette: bool) {
+        if matches!(self.tool, Tool::Nav | Tool::Eraser) && self.text_edit.is_none() {
+            self.set_tool(self.last_draw);
+        }
+        match self.style_target() {
+            StyleTarget::Text => {
+                match self.text_edit.as_mut() {
+                    Some(te) => {
+                        te.color = color;
+                        // A new text's style is the current text style; an existing text's
+                        // edit leaves the pen alone.
+                        if te.editing_id.is_none() {
+                            self.pen.color = color;
+                        }
                     }
+                    None => self.pen.color = color,
                 }
             }
-        }
-
-        // Continue a drag, keeping the grab point under the cursor.
-        if response.dragged_by(primary) {
-            if let Some(drag) = self.tools.text_drag.clone() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let doc = self.cam.screen_to_doc(pos, viewport);
-                    let new_anchor = doc - drag.grab;
-                    let r = self.layout.page_rect(drag.before.page);
-                    let nx = ((new_anchor.x - r.min.x) / r.width()).clamp(0.0, 1.0);
-                    let ny = ((new_anchor.y - r.min.y) / r.height()).clamp(0.0, 1.0);
-                    self.set.set_text_pos(drag.id, [nx, ny]);
-                }
-            }
-        }
-
-        // Finish a drag: record one undo entry only if it actually moved.
-        if response.drag_stopped_by(primary) {
-            if let Some(drag) = self.tools.text_drag.take() {
-                if let Some(after) = self.set.text_by_id(drag.id).cloned() {
-                    if after.pos != drag.before.pos {
-                        self.history.record_edit_text(drag.before, after);
-                    }
-                }
-            }
-        }
-
-        // A plain click edits the text under the cursor, or opens a new editor.
-        if response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let doc = self.cam.screen_to_doc(pos, viewport);
-                if let Some(id) = self.text_at_doc(ctx, doc) {
-                    self.open_existing_text(id);
-                } else if let Some((page, norm)) = self.layout.page_at_doc(doc) {
-                    self.open_new_text(page, norm);
-                }
-            }
-        }
-    }
-
-    fn open_new_text(&mut self, page: usize, pos: [f32; 2]) {
-        self.tools.text_edit = Some(TextEditing {
-            page,
-            pos,
-            buffer: String::new(),
-            editing_id: None,
-            just_opened: true,
-        });
-    }
-
-    /// Open the editor on an existing annotation, loading its style into the pen so the
-    /// toolbar reflects it (and edits to colour/size apply on commit).
-    fn open_existing_text(&mut self, id: u64) {
-        if let Some(t) = self.set.text_by_id(id) {
-            self.color =
-                Color32::from_rgba_unmultiplied(t.color[0], t.color[1], t.color[2], t.color[3]);
-            self.font_pt = t.size_pt;
-            self.tools.text_edit = Some(TextEditing {
-                page: t.page,
-                pos: t.pos,
-                buffer: t.text.clone(),
-                editing_id: Some(id),
-                just_opened: true,
-            });
-        }
-    }
-
-    /// Commit the open editor: add a new text, update an existing one (content/colour/size),
-    /// or delete it if emptied. Discards a new-but-empty editor.
-    fn commit_text(&mut self) {
-        let Some(te) = self.tools.text_edit.take() else {
-            return;
-        };
-        let text = te.buffer.trim().to_string();
-        let color = self.color.to_srgba_unmultiplied();
-
-        match te.editing_id {
-            Some(id) => {
-                let Some(before) = self.set.text_by_id(id).cloned() else {
-                    return;
-                };
-                if text.is_empty() {
-                    if let Some(removed) = self.set.remove(id) {
-                        self.history.record_erase(removed);
-                    }
-                    return;
-                }
-                let after = TextAnnotation {
-                    text,
-                    color,
-                    size_pt: self.font_pt,
-                    ..before.clone()
-                };
-                if after.text != before.text
-                    || after.color != before.color
-                    || after.size_pt != before.size_pt
-                {
-                    self.set.replace_text(after.clone());
-                    self.history.record_edit_text(before, after);
-                }
-            }
-            None => {
-                if text.is_empty() {
-                    return;
-                }
-                let t = TextAnnotation {
-                    page: te.page,
-                    pos: te.pos,
-                    text,
-                    color,
-                    size_pt: self.font_pt,
-                    id: 0,
-                };
-                let id = self.set.add_text(t);
-                if let Some(added) = self.set.text_by_id(id) {
-                    self.history.record_add(Annotation::Text(added.clone()));
-                }
-            }
-        }
-    }
-
-    fn cancel_text(&mut self) {
-        self.tools.text_edit = None;
-    }
-
-    /// Render the live text editor (a small overlay anchored at the text position).
-    /// Enter or clicking away commits; Escape cancels. The editor itself stays
-    /// axis-aligned even when the page is rotated; committed text follows the rotation.
-    fn text_overlay(&mut self, ctx: &egui::Context, viewport: Rect) {
-        let Some(te) = self.tools.text_edit.as_ref() else {
-            return;
-        };
-        let anchor = self
-            .cam
-            .doc_to_screen(self.layout.norm_to_doc(te.page, te.pos), viewport);
-        let px = (self.font_pt * self.cam.zoom).max(8.0);
-
-        let (mut commit, mut cancel) = (false, false);
-        egui::Area::new(egui::Id::new("nullpdf_text_editor"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(anchor)
-            .show(ctx, |ui| {
-                let te = self.tools.text_edit.as_mut().unwrap();
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut te.buffer)
-                        .font(egui::FontId::proportional(px))
-                        .text_color(self.color)
-                        .desired_width((px * 8.0).max(120.0)),
-                );
-                if te.just_opened {
-                    resp.request_focus();
-                    te.just_opened = false;
-                }
-                if resp.lost_focus() {
-                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        cancel = true;
-                    } else {
-                        commit = true;
-                    }
-                }
-            });
-        if commit {
-            self.commit_text();
-        } else if cancel {
-            self.cancel_text();
-        }
-    }
-
-    // --- input -----------------------------------------------------------------
-
-    fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        let (mut want_open, mut want_save, mut want_export) = (false, false, false);
-        // While a text editor is focused, single-letter keys are text input, not shortcuts.
-        let typing = ctx.egui_wants_keyboard_input();
-        ctx.input(|i| {
-            if !typing && i.key_pressed(egui::Key::D) {
-                self.tools.mode = Mode::Draw;
-            }
-            if !typing && i.key_pressed(egui::Key::T) {
-                self.tools.mode = Mode::Text;
-            }
-            if !typing && i.key_pressed(egui::Key::Q) {
-                self.tools.mode = Mode::Nav;
-                self.tools.active = None;
-            }
-            let cmd = i.modifiers.command;
-            if !typing && i.key_pressed(egui::Key::E) && !cmd && self.tools.mode == Mode::Draw {
-                self.tools.eraser = !self.tools.eraser;
-            }
-            want_open = cmd && i.key_pressed(egui::Key::O);
-            want_save = cmd && i.key_pressed(egui::Key::S);
-            want_export = cmd && i.key_pressed(egui::Key::E);
-            if cmd && i.key_pressed(egui::Key::Z) {
-                if i.modifiers.shift {
-                    self.history.redo(&mut self.set);
+            StyleTarget::Highlighter => {
+                self.highlighter.color = if from_palette {
+                    with_alpha(color, HIGHLIGHT_ALPHA)
                 } else {
-                    self.history.undo(&mut self.set);
-                }
+                    color
+                };
             }
-            if cmd && i.key_pressed(egui::Key::Y) {
-                self.history.redo(&mut self.set);
-            }
-        });
-        // rfd / save need `&mut self`, which isn't available inside the input closure.
-        if want_open {
-            self.open_dialog();
-        }
-        if want_save {
-            self.save_sidecar();
-        }
-        if want_export {
-            self.export_dialog();
+            StyleTarget::Pen => self.pen.color = color,
         }
     }
 
-    /// Wheel scroll / ctrl-wheel zoom, applied when the pointer is over the canvas.
-    fn handle_scroll_zoom(&mut self, ctx: &egui::Context, viewport: Rect) {
-        ctx.input(|i| {
-            let Some(cursor) = i.pointer.hover_pos() else {
-                return;
-            };
-            if !viewport.contains(cursor) {
-                return;
-            }
-            let zoom_delta = i.zoom_delta();
-            if (zoom_delta - 1.0).abs() > f32::EPSILON {
-                self.cam.zoom_around(zoom_delta, cursor, viewport);
-            } else {
-                let dy = i.smooth_scroll_delta.y;
-                if dy != 0.0 {
-                    // Wheel up moves up the page stack; negate so the gesture isn't
-                    // inverted, and scale for a slightly brisker feel.
-                    self.cam.scroll(-dy * SCROLL_SPEED);
-                }
-            }
-        });
-    }
-
-    fn handle_canvas(&mut self, ctx: &egui::Context, response: &egui::Response, viewport: Rect) {
-        // Right-drag rotates in either mode.
-        if response.dragged_by(egui::PointerButton::Secondary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let cur = (pos - viewport.center()).angle();
-                if let Some(last) = self.tools.last_rotate_angle {
-                    let mut d = cur - last;
-                    let pi = std::f32::consts::PI;
-                    while d > pi {
-                        d -= std::f32::consts::TAU;
-                    }
-                    while d < -pi {
-                        d += std::f32::consts::TAU;
-                    }
-                    self.cam.rotate_by(d);
-                }
-                self.tools.last_rotate_angle = Some(cur);
-            }
-        } else {
-            self.tools.last_rotate_angle = None;
+    /// The size the toolbar shows and `[`/`]` step: (value, ladder, unit).
+    fn current_size(&self) -> (f32, &'static [f32], &'static str) {
+        if self.tool == Tool::Eraser && self.text_edit.is_none() {
+            return (self.eraser_px, &ERASER_SIZES, "px");
         }
-
-        match self.tools.mode {
-            Mode::Nav => {
-                if response.dragged_by(egui::PointerButton::Primary) {
-                    self.cam.pan(response.drag_delta());
-                }
-            }
-            Mode::Draw => self.handle_draw(ctx, response, viewport),
-            Mode::Text => self.handle_text(ctx, response, viewport),
+        match self.style_target() {
+            StyleTarget::Text => (
+                self.text_edit
+                    .as_ref()
+                    .map_or(self.text_size, |te| te.size_pt),
+                &FONT_SIZES,
+                "pt",
+            ),
+            StyleTarget::Highlighter => (self.highlighter.size, &STROKE_SIZES, "pt"),
+            StyleTarget::Pen => (self.pen.size, &STROKE_SIZES, "pt"),
         }
     }
 
-    fn handle_draw(&mut self, ctx: &egui::Context, response: &egui::Response, viewport: Rect) {
-        let shift = ctx.input(|i| i.modifiers.shift);
-        let primary = egui::PointerButton::Primary;
-
-        if response.drag_started_by(primary) || response.dragged_by(primary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let doc = self.cam.screen_to_doc(pos, viewport);
-                if self.tools.eraser {
-                    self.erase_at(ctx, doc);
-                    return;
-                }
-                match &mut self.tools.active {
-                    None => {
-                        if let Some((page, norm)) = self.layout.page_at_doc(doc) {
-                            self.tools.active = Some(ActiveStroke {
-                                page,
-                                points: vec![norm],
-                            });
-                        }
-                    }
-                    Some(active) => {
-                        // Lock subsequent points to the page the stroke started on.
-                        let r = self.layout.page_rect(active.page);
-                        let nx = ((doc.x - r.min.x) / r.width()).clamp(0.0, 1.0);
-                        let ny = ((doc.y - r.min.y) / r.height()).clamp(0.0, 1.0);
-                        // Drop near-duplicate samples so jitter doesn't accumulate; the
-                        // Chaikin pass on finalize then smooths what remains.
-                        let last = active.points.last().copied().unwrap_or([nx, ny]);
-                        let moved = (nx - last[0]).hypot(ny - last[1]);
-                        if moved >= MIN_SAMPLE_DIST {
-                            active.points.push([nx, ny]);
-                        }
-                    }
-                }
-            }
-        }
-
-        if response.drag_stopped_by(primary) && !self.tools.eraser {
-            self.finalize_stroke(shift);
-        }
-    }
-
-    // --- painting --------------------------------------------------------------
-
-    fn paint(&mut self, ctx: &egui::Context, painter: &egui::Painter, viewport: Rect) {
-        // Pages as rotated textured quads.
-        for i in 0..self.layout.pages.len() {
-            let r = self.layout.page_rect(i);
-            let corners_doc = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
-            let scr: [Pos2; 4] =
-                std::array::from_fn(|k| self.cam.doc_to_screen(corners_doc[k], viewport));
-            let bb = Rect::from_points(&scr);
-            if !bb.intersects(viewport) {
-                continue;
-            }
-
-            if let Some(pdf) = self.pdf.as_mut() {
-                if let Some((tex_id, _)) = pdf.page_texture(ctx, i, self.cam.zoom) {
-                    let uv = [
-                        Pos2::new(0.0, 0.0),
-                        Pos2::new(1.0, 0.0),
-                        Pos2::new(1.0, 1.0),
-                        Pos2::new(0.0, 1.0),
-                    ];
-                    let mut mesh = egui::Mesh::with_texture(tex_id);
-                    for k in 0..4 {
-                        mesh.vertices.push(egui::epaint::Vertex {
-                            pos: scr[k],
-                            uv: uv[k],
-                            color: Color32::WHITE,
-                        });
-                    }
-                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-                    painter.add(mesh);
-                    continue;
-                }
-            }
-            // Fallback placeholder while rendering / when no doc.
-            painter.add(egui::Shape::convex_polygon(
-                scr.to_vec(),
-                Color32::from_gray(48),
-                EStroke::NONE,
-            ));
-        }
-
-        // Committed strokes.
-        for s in &self.set.strokes {
-            self.paint_stroke(painter, viewport, &s.points, s.page, s.color, s.width_pt);
-        }
-
-        // Committed text, except the one currently shown by the live editor.
-        let editing = self.tools.text_edit.as_ref().and_then(|te| te.editing_id);
-        for t in &self.set.texts {
-            if Some(t.id) == editing {
-                continue;
-            }
-            self.paint_text(ctx, painter, viewport, t);
-        }
-
-        // In-progress preview using current pen settings.
-        if let Some(active) = &self.tools.active {
-            let shift = ctx.input(|i| i.modifiers.shift);
-            let color = self.color.to_srgba_unmultiplied();
-            if shift && active.points.len() >= 2 {
-                let pts = [active.points[0], *active.points.last().unwrap()];
-                self.paint_stroke(painter, viewport, &pts, active.page, color, self.width_pt);
-            } else {
-                // Preview the smoothed path so it matches the committed stroke (WYSIWYG).
-                let smoothed = chaikin(&active.points, 2);
-                self.paint_stroke(painter, viewport, &smoothed, active.page, color, self.width_pt);
-            }
-        }
-    }
-
-    fn paint_stroke(
-        &self,
-        painter: &egui::Painter,
-        viewport: Rect,
-        norm_points: &[[f32; 2]],
-        page: usize,
-        color: [u8; 4],
-        width_pt: f32,
-    ) {
-        if norm_points.len() < 2 {
+    fn set_size(&mut self, value: f32) {
+        if self.tool == Tool::Eraser && self.text_edit.is_none() {
+            self.eraser_px = value;
             return;
         }
-        let pts: Vec<Pos2> = norm_points
+        match self.style_target() {
+            StyleTarget::Text => match self.text_edit.as_mut() {
+                Some(te) => {
+                    te.size_pt = value;
+                    if te.editing_id.is_none() {
+                        self.text_size = value;
+                    }
+                }
+                None => self.text_size = value,
+            },
+            StyleTarget::Highlighter => self.highlighter.size = value,
+            StyleTarget::Pen => self.pen.size = value,
+        }
+    }
+
+    fn step_size(&mut self, dir: i32) {
+        let (value, ladder, unit) = self.current_size();
+        let next = step_size(ladder, value, dir);
+        self.set_size(next);
+        self.hint(format!("Size {} {unit}", format_size(next)));
+    }
+
+    fn set_tool(&mut self, tool: Tool) {
+        if tool == self.tool {
+            return;
+        }
+        self.finish_gesture(true);
+        if tool != Tool::Text {
+            self.commit_text();
+        }
+        if tool.draws() {
+            self.last_draw = tool;
+        }
+        self.tool = tool;
+        self.hint(tool.name());
+    }
+
+    // --- history -------------------------------------------------------------------
+
+    fn undo(&mut self) {
+        // Mid-stroke (or mid-erase/move), undo means "not this": just drop the gesture.
+        if matches!(
+            self.gesture,
+            Gesture::Draw(_) | Gesture::Erase { .. } | Gesture::TextDrag { .. }
+        ) {
+            self.cancel_gesture();
+            return;
+        }
+        self.commit_text();
+        self.cancel_gesture();
+        match self.history.undo(&mut self.set) {
+            Some(touched) => {
+                self.mark_dirty();
+                self.reveal(&touched);
+            }
+            None => self.notify("Nothing to undo"),
+        }
+    }
+
+    fn redo(&mut self) {
+        self.commit_text();
+        self.cancel_gesture();
+        match self.history.redo(&mut self.set) {
+            Some(touched) => {
+                self.mark_dirty();
+                self.reveal(&touched);
+            }
+            None => self.notify("Nothing to redo"),
+        }
+    }
+
+    /// If none of `anns` is on screen, glide the view to them, so an undo/redo is never
+    /// an invisible change on some other page.
+    fn reveal(&mut self, anns: &[Annotation]) {
+        let Some(bbox) = anns
             .iter()
-            .map(|n| {
-                let doc = self.layout.norm_to_doc(page, *n);
-                self.cam.doc_to_screen(doc, viewport)
+            .filter(|a| a.page() < self.layout.len())
+            .map(|a| match a {
+                Annotation::Stroke(s) => self.stroke_bbox_doc(s),
+                Annotation::Text(t) => self.text_bbox_doc(t),
+            })
+            .reduce(Rect::union)
+        else {
+            return;
+        };
+        let view = self.cam.doc_bbox(self.safe_rect(), self.viewport);
+        if view.intersects(bbox) {
+            return;
+        }
+        let mut target = self.glide_target();
+        if target.is_upright() {
+            // Minimal move: only along an axis where the change is out of view, so the
+            // page doesn't also jump sideways.
+            let shift = |lo: f32, hi: f32, vlo: f32, vhi: f32| {
+                if hi < vlo || lo > vhi {
+                    (lo + hi - vlo - vhi) * 0.5
+                } else {
+                    0.0
+                }
+            };
+            target.center.x += shift(bbox.min.x, bbox.max.x, view.min.x, view.max.x);
+            target.center.y += shift(bbox.min.y, bbox.max.y, view.min.y, view.max.y);
+        } else {
+            let safe = self.safe_rect().center();
+            target.center = target.center_for(bbox.center(), safe, self.viewport);
+        }
+        self.glide_to(target);
+    }
+
+    // --- camera ----------------------------------------------------------------------
+
+    /// The part of the viewport not covered by floating chrome.
+    fn safe_rect(&self) -> Rect {
+        let mut r = self.viewport;
+        if self.chrome_visible && self.pdf.is_some() {
+            r.min.y += TOOLBAR_SPACE;
+            r.max.y -= STATUS_SPACE;
+        }
+        if r.height() < 40.0 {
+            return self.viewport;
+        }
+        r
+    }
+
+    fn glide_target(&self) -> Camera {
+        self.glide.unwrap_or(self.cam)
+    }
+
+    fn glide_to(&mut self, mut target: Camera) {
+        target.clamp_to(&self.layout, self.viewport, self.safe_rect());
+        self.glide = Some(target);
+    }
+
+    /// The page under the centre of the visible area (what the status line calls "current").
+    fn current_page(&self) -> usize {
+        self.page_under(&self.cam)
+    }
+
+    /// The page under the centre of the visible area as seen by `cam`.
+    fn page_under(&self, cam: &Camera) -> usize {
+        let c = cam.screen_to_doc(self.safe_rect().center(), self.viewport);
+        self.layout.page_near_y(c.y).unwrap_or(0)
+    }
+
+    /// Zoom that fits page `i`'s width (as rotated by `cam`) into the visible area.
+    fn fit_width_zoom(&self, cam: &Camera, i: usize) -> f32 {
+        let p = self.layout.pages[i];
+        let unit = Camera { zoom: 1.0, ..*cam };
+        let ext = unit.screen_extent(Vec2::new(p.w, p.h));
+        ((self.safe_rect().width() - 2.0 * FIT_MARGIN) / ext.x).min(MAX_FIT_ZOOM)
+    }
+
+    /// Camera that centres page `i` in the visible area, zoomed to fit it whole.
+    fn fit_page_camera(&self, base: Camera, i: usize) -> Camera {
+        let p = self.layout.pages[i];
+        let safe = self.safe_rect();
+        let unit = Camera { zoom: 1.0, ..base };
+        let ext = unit.screen_extent(Vec2::new(p.w, p.h));
+        let zoom = ((safe.width() - 2.0 * FIT_MARGIN) / ext.x)
+            .min((safe.height() - 2.0 * FIT_MARGIN) / ext.y);
+        let mut cam = Camera { zoom, ..base };
+        cam.center = cam.center_for(
+            self.layout.page_rect(i).center(),
+            safe.center(),
+            self.viewport,
+        );
+        cam
+    }
+
+    /// Where the camera goes to "show" page `i` at the current zoom and rotation: a page
+    /// that fits is centred; a taller one is shown from its top edge. Horizontally, a page
+    /// wider than the view keeps the current pan.
+    fn page_camera(&self, base: Camera, i: usize) -> Camera {
+        let safe = self.safe_rect();
+        let r = self.layout.page_rect(i);
+        let ext = base.screen_extent(r.size());
+        let current = base.doc_to_screen(r.center(), self.viewport);
+        let x = if ext.x <= safe.width() {
+            safe.center().x
+        } else {
+            current.x
+        };
+        let y = if ext.y <= safe.height() {
+            safe.center().y
+        } else {
+            safe.top() + FIT_MARGIN + ext.y * 0.5
+        };
+        let mut cam = base;
+        cam.center = cam.center_for(r.center(), Pos2::new(x, y), self.viewport);
+        cam.clamp_to(&self.layout, self.viewport, safe);
+        cam
+    }
+
+    /// `base` re-fitted to its current page: the whole page for [`Fit::Page`]; for
+    /// [`Fit::Width`], the page's width, keeping the reading position and (upright) centring
+    /// the page across the view.
+    fn fitted(&self, base: Camera, fit: Fit) -> Camera {
+        let page = self.page_under(&base);
+        match fit {
+            Fit::Page => self.fit_page_camera(base, page),
+            Fit::Width => {
+                let safe = self.safe_rect();
+                let centre = base.screen_to_doc(safe.center(), self.viewport);
+                let mut cam = base;
+                cam.zoom = self.fit_width_zoom(&base, page);
+                let anchor = if base.is_upright() {
+                    Pos2::new(self.layout.page_rect(page).center().x, centre.y)
+                } else {
+                    centre
+                };
+                cam.center = cam.center_for(anchor, safe.center(), self.viewport);
+                cam
+            }
+        }
+    }
+
+    /// Enter fit mode `fit` and glide there.
+    fn fit_to(&mut self, fit: Fit, base: Camera) {
+        self.fit = Some(fit);
+        self.fit_safe = self.safe_rect();
+        let cam = self.fitted(base, fit);
+        self.glide_to(cam);
+    }
+
+    /// Re-apply the fit in force if the visible area changed size (window resize, toolbar
+    /// shown/hidden). Instant, so the page tracks the window edge while resizing.
+    fn keep_fit(&mut self) {
+        let safe = self.safe_rect();
+        let Some(fit) = self.fit else {
+            return;
+        };
+        if safe == self.fit_safe || self.layout.is_empty() || !self.gesture.is_none() {
+            return;
+        }
+        self.fit_safe = safe;
+        let mut cam = self.fitted(self.glide_target(), fit);
+        cam.clamp_to(&self.layout, self.viewport, safe);
+        self.cam = cam;
+        self.glide = None;
+    }
+
+    /// Initial view of a freshly opened document: upright, first page fitted to the width
+    /// and shown from its top.
+    fn initial_view(&mut self) {
+        self.needs_fit = false;
+        let mut cam = Camera::default();
+        cam.zoom = self.fit_width_zoom(&cam, 0);
+        let mut cam = self.page_camera(cam, 0);
+        cam.clamp_to(&self.layout, self.viewport, self.safe_rect());
+        self.cam = cam;
+        self.prev_cam = cam;
+        self.glide = None;
+        self.fit = Some(Fit::Width);
+        self.fit_safe = self.safe_rect();
+    }
+
+    /// Upright + fit width on the current page, keeping what's at the centre of the view
+    /// in place vertically.
+    fn reset_view(&mut self) {
+        let mut base = self.glide_target();
+        base.rotation = 0.0;
+        self.fit_to(Fit::Width, base);
+    }
+
+    fn goto_page(&mut self, dir: i32) {
+        if self.layout.is_empty() {
+            return;
+        }
+        let base = self.glide_target();
+        let tol = 1.0 / base.zoom;
+        let n = self.layout.len();
+        let target = |i: usize| self.page_camera(base, i);
+        let pick = match dir {
+            i32::MIN => Some(0),
+            i32::MAX => Some(n - 1),
+            d if d > 0 => (0..n).find(|&i| target(i).center.y > base.center.y + tol),
+            _ => (0..n)
+                .rev()
+                .find(|&i| target(i).center.y < base.center.y - tol),
+        };
+        if let Some(i) = pick {
+            let cam = target(i);
+            self.glide_to(cam);
+        }
+    }
+
+    /// Scroll by `screen_px` along the reading direction (doc y), animated.
+    fn scroll_by(&mut self, screen_px: f32) {
+        let mut cam = self.glide_target();
+        cam.center.y += screen_px / cam.zoom;
+        self.glide_to(cam);
+    }
+
+    /// Scroll by a fraction of the visible area's extent along doc y.
+    fn scroll_screen(&mut self, dir: f32) {
+        let cam = self.glide_target();
+        let extent = cam.doc_half_extent(self.safe_rect().size()).y * 2.0 * cam.zoom;
+        self.scroll_by(dir * extent * SCREEN_STEP);
+    }
+
+    fn zoom_step(&mut self, factor: f32) {
+        self.fit = None;
+        let mut cam = self.glide_target();
+        cam.zoom_around(factor, self.safe_rect().center(), self.viewport);
+        self.glide_to(cam);
+    }
+
+    /// Quarter-turn to the next axis; a fit in force is re-applied for the new orientation.
+    fn rotate_step(&mut self, dir: f32) {
+        let mut cam = self.glide_target();
+        cam.rotation = next_axis(cam.rotation, dir);
+        if let Some(fit) = self.fit {
+            cam = self.fitted(cam, fit);
+        }
+        self.glide_to(cam);
+    }
+
+    /// Advance the camera glide and clamp, and note when the view last changed.
+    fn update_camera(&mut self, dt: f32) {
+        if let Some(target) = self.glide {
+            if !self.cam.step_toward(&target, dt) {
+                self.glide = None;
+            }
+        }
+        if !self.layout.is_empty() {
+            let safe = self.safe_rect();
+            self.cam.clamp_to(&self.layout, self.viewport, safe);
+        }
+        if self.cam != self.prev_cam {
+            self.view_changed_at = self.now;
+            self.prev_cam = self.cam;
+        }
+    }
+
+    fn view_settled(&self) -> bool {
+        self.glide.is_none() && self.now - self.view_changed_at > SETTLE_TIME
+    }
+
+    /// Ask the page cache for what this frame shows; returns whether rendering is pending.
+    fn prepare_pages(&mut self, ctx: &egui::Context) -> bool {
+        let settled = self.view_settled();
+        let Some(pdf) = self.pdf.as_mut() else {
+            return false;
+        };
+        let viewport = self.viewport;
+        let ppp = ctx.pixels_per_point();
+        let view = self.cam.doc_bbox(viewport, viewport);
+        let visible = self.layout.pages_in(view);
+        let needs: Vec<PageNeed> = visible
+            .clone()
+            .filter_map(|i| {
+                let r = self.layout.page_rect(i);
+                let shown = r.intersect(view);
+                if !shown.is_positive() {
+                    return None;
+                }
+                let local = shown.translate(-r.min.to_vec2());
+                let centre = self.cam.doc_to_screen(r.center(), viewport);
+                Some(PageNeed {
+                    index: i,
+                    scale: self.cam.zoom * ppp,
+                    visible: local,
+                    priority: centre.distance(viewport.center()),
+                })
             })
             .collect();
-        let col = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-        let stroke = EStroke::new((width_pt * self.cam.zoom).max(0.5), col);
-        painter.add(egui::Shape::line(pts, stroke));
+        let keep = visible.start.saturating_sub(1)..(visible.end + 1).min(self.layout.len());
+        pdf.prepare(ctx, &needs, keep, settled)
     }
 
-    /// Paint a committed text annotation as a rotated, zoom-scaled galley.
-    fn paint_text(
-        &self,
-        ctx: &egui::Context,
-        painter: &egui::Painter,
-        viewport: Rect,
-        t: &TextAnnotation,
-    ) {
-        if t.text.is_empty() {
+    // --- actions -------------------------------------------------------------------
+
+    fn dispatch(&mut self, action: Action) {
+        // The cheat sheet is a quick reference: using any shortcut from it dismisses it.
+        if self.help_open && !matches!(action, Action::Help | Action::Cancel) {
+            self.help_open = false;
+        }
+        if action.needs_document() && self.pdf.is_none() {
             return;
         }
-        let px = (t.size_pt * self.cam.zoom).max(1.0);
-        let col = Color32::from_rgba_unmultiplied(t.color[0], t.color[1], t.color[2], t.color[3]);
-        let galley =
-            ctx.fonts_mut(|f| f.layout_no_wrap(t.text.clone(), egui::FontId::proportional(px), col));
-        let anchor = self
-            .cam
-            .doc_to_screen(self.layout.norm_to_doc(t.page, t.pos), viewport);
-        painter.add(egui::epaint::TextShape::new(anchor, galley, col).with_angle(self.cam.rotation));
+        match action {
+            Action::Tool(t) => self.set_tool(t),
+            Action::ToggleEraser => {
+                let t = if self.tool == Tool::Eraser {
+                    self.last_draw
+                } else {
+                    Tool::Eraser
+                };
+                self.set_tool(t);
+            }
+            Action::Color(i) => {
+                self.set_color(PALETTE[i].1, true);
+                self.hint(PALETTE[i].0);
+            }
+            Action::SizeDown => self.step_size(-1),
+            Action::SizeUp => self.step_size(1),
+            Action::Undo => self.undo(),
+            Action::Redo => self.redo(),
+            Action::ZoomIn => self.zoom_step(ZOOM_STEP),
+            Action::ZoomOut => self.zoom_step(1.0 / ZOOM_STEP),
+            Action::ResetView => self.reset_view(),
+            Action::FitPage => self.fit_to(Fit::Page, self.glide_target()),
+            Action::RotateCw => self.rotate_step(1.0),
+            Action::RotateCcw => self.rotate_step(-1.0),
+            Action::ScrollUp => self.scroll_by(-ARROW_STEP),
+            Action::ScrollDown => self.scroll_by(ARROW_STEP),
+            Action::PrevPage => self.goto_page(-1),
+            Action::NextPage => self.goto_page(1),
+            Action::FirstPage => self.goto_page(i32::MIN),
+            Action::LastPage => self.goto_page(i32::MAX),
+            Action::ScreenUp => self.scroll_screen(-1.0),
+            Action::ScreenDown => self.scroll_screen(1.0),
+            Action::Open => self.open_dialog(),
+            Action::Save => self.save(),
+            Action::Export => self.export_dialog(),
+            Action::Help => self.help_open = !self.help_open,
+            Action::ToggleChrome => {
+                self.chrome_visible = !self.chrome_visible;
+                if !self.chrome_visible {
+                    self.notify("Toolbar hidden — Tab brings it back");
+                }
+            }
+            Action::Cancel => {
+                if self.help_open {
+                    self.help_open = false;
+                } else if !self.gesture.is_none() {
+                    self.cancel_gesture();
+                } else if self.text_edit.is_some() {
+                    self.cancel_text();
+                } else if self.tool != Tool::Nav {
+                    self.set_tool(Tool::Nav);
+                }
+            }
+        }
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("Open").clicked() {
-                self.open_dialog();
-            }
-            ui.add_enabled_ui(self.pdf.is_some(), |ui| {
-                if ui.button("Export").clicked() {
-                    self.export_dialog();
-                }
-            });
-            ui.separator();
+    // --- frame plumbing ------------------------------------------------------------
 
-            ui.selectable_value(&mut self.tools.mode, Mode::Nav, "Nav (Q)");
-            ui.selectable_value(&mut self.tools.mode, Mode::Draw, "Draw (D)");
-            ui.selectable_value(&mut self.tools.mode, Mode::Text, "Text (T)");
-
-            ui.add_enabled_ui(self.tools.mode == Mode::Draw, |ui| {
-                let label = ui.selectable_label(self.tools.eraser, "Eraser (E)");
-                if label.clicked() {
-                    self.tools.eraser = !self.tools.eraser;
-                }
-            });
-
-            ui.separator();
-            egui::color_picker::color_edit_button_srgba(
-                ui,
-                &mut self.color,
-                egui::color_picker::Alpha::OnlyBlend,
-            );
-            // The width slider doubles as the font-size slider in Text mode.
-            if self.tools.mode == Mode::Text {
-                ui.add(
-                    egui::Slider::new(&mut self.font_pt, 6.0..=96.0)
-                        .text("font")
-                        .fixed_decimals(0),
-                );
-            } else {
-                ui.add(
-                    egui::Slider::new(&mut self.width_pt, 0.5..=24.0)
-                        .text("width")
-                        .fixed_decimals(1),
-                );
-            }
-
-            ui.separator();
-            ui.add_enabled_ui(self.history.can_undo(), |ui| {
-                if ui.button("Undo").clicked() {
-                    self.history.undo(&mut self.set);
-                }
-            });
-            ui.add_enabled_ui(self.history.can_redo(), |ui| {
-                if ui.button("Redo").clicked() {
-                    self.history.redo(&mut self.set);
-                }
-            });
-
-            if ui.button("Reset rotation").clicked() {
-                self.cam.rotation = 0.0;
-            }
+    /// Open a PDF dropped onto the window.
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let pdf = dropped.iter().filter_map(|f| f.path.clone()).find(|p| {
+            p.extension()
+                .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("pdf"))
         });
+        match pdf {
+            Some(path) => self.open_path(&path),
+            None => self.error("Only PDF files can be opened"),
+        }
     }
 
-    /// Bottom status bar: a single truncating line so long messages/paths stay on
-    /// one row instead of wrapping or pushing the layout.
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.add(egui::Label::new(&self.status).truncate());
-        });
+    /// Save on close; if saving fails, refuse the first close so annotations aren't lost
+    /// without warning.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        // Keep whatever is in progress: a stroke whose release lands in the same frame as
+        // the close request must not be lost.
+        self.commit_text();
+        self.finish_gesture(true);
+        if self.close_armed || !self.dirty {
+            return;
+        }
+        if let Err(e) = self.save_now() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_armed = true;
+            self.error(format!(
+                "Couldn't save annotations ({e}) — close again to quit without them"
+            ));
+        }
+    }
+
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let title = match self.pdf_path {
+            Some(_) => format!("{} — nullpdf", self.file_name()),
+            None => "nullpdf".to_string(),
+        };
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
     }
 }
 
 impl eframe::App for App {
+    /// Tab toggles the chrome; it is removed from egui's input here so it can never move
+    /// keyboard focus onto a toolbar widget (which would swallow later shortcuts).
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let typing = ctx.text_edit_focused();
+        raw_input.events.retain(|e| match e {
+            egui::Event::Key {
+                key: egui::Key::Tab,
+                pressed,
+                modifiers,
+                ..
+            } => {
+                if *pressed && !self.tab_down && !typing && !modifiers.any() {
+                    self.queued.push(Action::ToggleChrome);
+                }
+                self.tab_down = *pressed;
+                false
+            }
+            _ => true,
+        });
+    }
+
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        self.now = ctx.input(|i| i.time);
+        let dt = ctx.input(|i| i.stable_dt).min(0.05);
 
-        // Watch the source file for external edits and keep waking up to poll it.
         self.check_reload();
-        if self.pdf_path.is_some() {
-            ctx.request_repaint_after(RELOAD_POLL);
+        self.handle_drops(&ctx);
+        self.handle_close(&ctx);
+        self.handle_keyboard();
+
+        let mut pending_render = false;
+        egui::CentralPanel::no_frame().show_inside(root, |ui| {
+            let (response, painter) =
+                ui.allocate_painter(ui.available_size(), Sense::CLICK | Sense::DRAG);
+            self.viewport = response.rect;
+            if self.needs_fit && !self.layout.is_empty() {
+                self.initial_view();
+            }
+            self.keep_fit();
+            self.handle_pointer(&response);
+            self.update_camera(dt);
+            pending_render = self.prepare_pages(&ctx);
+            self.paint(&painter, &response);
+        });
+        self.text_overlay();
+
+        let mut actions = Vec::new();
+        self.chrome(&mut actions);
+        for a in actions {
+            self.dispatch(a);
         }
 
-        self.handle_keyboard(&ctx);
+        self.autosave_tick();
+        self.update_title(&ctx);
 
-        egui::Panel::top("toolbar").show_inside(root, |ui| {
-            self.toolbar(ui);
-        });
-
-        egui::Panel::bottom("statusbar").show_inside(root, |ui| {
-            self.status_bar(ui);
-        });
-
-        egui::CentralPanel::default().show_inside(root, |ui| {
-            let (response, painter) =
-                ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-            let viewport = response.rect;
-
-            if !self.cam.initialized && !self.layout.pages.is_empty() {
-                self.cam.fit(&self.layout, viewport);
+        // Repaint scheduling: animations and pending renders now; settling, autosave and a
+        // failed reload a little later. Otherwise the app sleeps until input (or the file
+        // watcher) wakes it.
+        if pending_render || self.glide.is_some() {
+            ctx.request_repaint();
+        }
+        if let Some(t) = &self.toast {
+            // Frames only while fading in/out; in between, wake up when the fade-out starts.
+            let age = self.now - t.born;
+            let fade_out = t.ttl() - TOAST_FADE_OUT;
+            if age < TOAST_FADE_IN || age >= fade_out {
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(Duration::from_secs_f64(fade_out - age));
             }
+        }
+        if self.now - self.view_changed_at <= SETTLE_TIME + 0.05 {
+            ctx.request_repaint_after(Duration::from_secs_f64(SETTLE_TIME));
+        }
+        if self.dirty {
+            ctx.request_repaint_after(Duration::from_secs_f64(AUTOSAVE_DELAY));
+        }
+        if self.reload_retry {
+            ctx.request_repaint_after(RELOAD_POLL);
+        }
+    }
 
-            self.handle_scroll_zoom(&ctx, viewport);
-            self.handle_canvas(&ctx, &response, viewport);
-            if !self.layout.pages.is_empty() {
-                self.cam.clamp_to(&self.layout, viewport);
-            }
-            self.paint(&ctx, &painter, viewport);
-            self.text_overlay(&ctx, viewport);
-
-            // Cursor hint by mode.
-            let cursor = match (self.tools.mode, self.tools.eraser) {
-                (Mode::Nav, _) => egui::CursorIcon::Grab,
-                (Mode::Draw, true) => egui::CursorIcon::NotAllowed,
-                (Mode::Draw, false) => egui::CursorIcon::Crosshair,
-                (Mode::Text, _) => egui::CursorIcon::Text,
-            };
-            ui.ctx().set_cursor_icon(cursor);
-        });
+    fn on_exit(&mut self) {
+        self.commit_text();
+        self.finish_gesture(true);
+        if self.dirty {
+            let _ = self.save_now();
+        }
     }
 }
 
-/// Shorten a path for the status bar, keeping the tail (filename) visible and
-/// middle-eliding with `…` so long paths don't overflow the bar.
-fn elide_path(path: &Path) -> String {
-    let full = path.display().to_string();
-    let chars: Vec<char> = full.chars().collect();
-    if chars.len() <= STATUS_PATH_MAX {
-        return full;
+/// `c` with its alpha replaced (straight, not premultiplied).
+fn with_alpha(c: Color32, a: u8) -> Color32 {
+    let [r, g, b, _] = c.to_srgba_unmultiplied();
+    Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+/// A size for display: "0.5", "1.5", "14".
+fn format_size(v: f32) -> String {
+    if (v - v.round()).abs() < 0.01 {
+        format!("{}", v.round() as i32)
+    } else {
+        let s = format!("{v:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
-    // Reserve a few leading chars and keep as much of the tail as fits.
-    let head = 6;
-    let tail = STATUS_PATH_MAX.saturating_sub(head + 1);
-    let head_str: String = chars[..head].iter().collect();
-    let tail_str: String = chars[chars.len() - tail..].iter().collect();
-    format!("{head_str}…{tail_str}")
 }
 
 /// Last-modified time of `path`, or `None` if it can't be stat'd.
@@ -892,14 +1255,10 @@ fn current_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Shortest distance from point `p` to segment `a`–`b`.
-fn point_segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
-    let ab = b - a;
-    let len_sq = ab.length_sq();
-    if len_sq <= f32::EPSILON {
-        return p.distance(a);
+/// Whether two paths name the same file (resolving symlinks/relative parts when possible).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
-    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
-    let proj = a + ab * t;
-    p.distance(proj)
 }

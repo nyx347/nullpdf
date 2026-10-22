@@ -1,16 +1,18 @@
 //! nullpdf — a minimal PDF reader focused on freehand drawing/annotation.
 //!
-//! Modes: `Q` navigation (left-drag pan, right-drag free-rotate w/ 5° axis snap,
-//! wheel scroll, ctrl+wheel zoom), `D` draw (left-drag freehand, hold Shift for a
-//! straight line, `E` eraser), and `T` text (click to place/edit, drag to move). One
-//! freehand tool doubles as a highlighter via the colour picker's alpha. Annotations
-//! (strokes + text) live in a `<pdf>.nullpdf.json` sidecar.
+//! Single-key tools: `Q` navigate, `D` pen, `H` highlighter, `E` eraser, `T` text; Shift
+//! draws straight lines, right-drag free-rotates (5° axis snap), wheel scrolls and
+//! ctrl+wheel zooms. `?` shows every shortcut. Annotations (strokes + text) live in a
+//! `<pdf>.nullpdf.json` sidecar that is saved automatically.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod annotation;
 mod app;
+mod icons;
+mod keymap;
 mod pdf;
+mod theme;
 mod tools;
 mod view;
 
@@ -23,7 +25,10 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 900.0])
-            .with_title("nullpdf"),
+            .with_min_inner_size([480.0, 360.0])
+            .with_title("nullpdf")
+            .with_app_id("nullpdf")
+            .with_icon(icons::app_icon()),
         ..Default::default()
     };
 
