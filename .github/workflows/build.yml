@@ -1,0 +1,144 @@
+# Lint and test, then build the release binaries: a Linux AppImage and a portable Windows
+# exe, each carrying its own pdfium. Pushing a `v*` tag (matching Cargo.toml's version, e.g.
+# v0.2.0) also publishes both as a GitHub release.
+
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # bblanchon/pdfium-binaries release chromium/<this>: the API version pdfium-render's
+  # `pdfium_latest` binds (pdfium_7543 for 0.8.37). Bump it together with pdfium-render.
+  PDFIUM_VERSION: '7543'
+  APPIMAGETOOL_VERSION: '1.9.0'
+
+jobs:
+  check:
+    name: Lint and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  appimage:
+    name: Linux AppImage
+    runs-on: ubuntu-24.04
+    # Built against Ubuntu 22.04's glibc (2.35), so the AppImage runs on distros that old.
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git desktop-file-utils file
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pdfium and appimagetool
+        run: |
+          mkdir -p "$RUNNER_TEMP/pdfium"
+          curl -fsSL "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F$PDFIUM_VERSION/pdfium-linux-x64.tgz" \
+            | tar -xz -C "$RUNNER_TEMP/pdfium"
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+          # No FUSE in a container: unpack the tool instead of mounting it.
+          ./appimagetool --appimage-extract > /dev/null
+          echo "APPIMAGETOOL=$RUNNER_TEMP/squashfs-root/AppRun" >> "$GITHUB_ENV"
+      - run: scripts/build-appimage.sh "$RUNNER_TEMP/pdfium"
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/*.AppImage
+          archive: false
+          if-no-files-found: error
+
+  windows:
+    name: Windows exe
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pdfium
+        run: |
+          pdfium="$(cygpath -m "$RUNNER_TEMP")/pdfium"
+          mkdir -p "$pdfium"
+          curl -fsSL "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F$PDFIUM_VERSION/pdfium-win-x64.tgz" \
+            | tar -xz -C "$pdfium"
+          echo "NULLPDF_PDFIUM_LIB=$pdfium/bin/pdfium.dll" >> "$GITHUB_ENV"
+      # pdfium.dll is compiled into the exe (and the C runtime linked statically, see
+      # .cargo/config.toml), so the one file runs on a stock Windows install.
+      - run: cargo build --release --locked --features bundled-pdfium
+      - name: Name the exe
+        run: |
+          version="$(awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml)"
+          mkdir dist
+          cp target/release/nullpdf.exe "dist/nullpdf-$version-windows-x86_64.exe"
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/*.exe
+          archive: false
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, appimage, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version="$(awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml)"
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Bundle pdfium's licenses
+        run: |
+          mkdir -p "$RUNNER_TEMP/pdfium"
+          curl -fsSL "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F$PDFIUM_VERSION/pdfium-linux-x64.tgz" \
+            | tar -xz -C "$RUNNER_TEMP/pdfium" LICENSE licenses
+          for f in "$RUNNER_TEMP/pdfium/LICENSE" "$RUNNER_TEMP"/pdfium/licenses/*; do
+            printf '==== %s ====\n\n' "$(basename "$f")"
+            cat "$f"
+            printf '\n\n'
+          done > dist/pdfium-licenses.txt
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes \
+            --title "nullpdf ${GITHUB_REF_NAME#v}"

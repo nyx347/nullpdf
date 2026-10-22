@@ -280,7 +280,8 @@ pub fn paint_hue_ring(painter: &Painter, center: Pos2, r_outer: f32, r_inner: f3
 }
 
 /// The window icon: a white page with lines of text and a red pen swoosh on a dark tile,
-/// rasterised here (4×4 supersampled) so the binary needs no image assets.
+/// rasterised here (4×4 supersampled) so the binary needs no image assets. The AppImage's
+/// `packaging/nullpdf.png` is a 256 px render of the same design: keep the two in step.
 pub fn app_icon() -> egui::IconData {
     const SIZE: usize = 64;
     const SS: usize = 4;

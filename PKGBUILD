@@ -33,7 +33,7 @@ build() {
 	cd "$startdir"
 	export CARGO_HOME="$startdir/target/cargo-home"
 	export RUSTUP_TOOLCHAIN=stable
-	cargo build --frozen --release --all-features
+	cargo build --frozen --release
 }
 
 package() {

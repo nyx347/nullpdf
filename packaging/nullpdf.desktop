@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=nullpdf
+GenericName=PDF Reader
+Comment=Read and mark up PDFs
+Exec=nullpdf %f
+Icon=nullpdf
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+Keywords=PDF;annotate;draw;highlight;
+StartupWMClass=nullpdf
